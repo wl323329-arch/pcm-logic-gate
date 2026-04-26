@@ -1,0 +1,27 @@
+j = 1;
+for(i=55:72)
+{
+addrect;  
+set("name","gra"+num2str(i));  
+#addmode;
+#set("name","MODE");
+#set("injection axis","x");
+#set("override global source settings",1);
+#set("wavelength start",1.55e-6);
+#set("wavelength stop",1.55e-6);
+#set("x",-1e-6);
+#set("y",-75e-6+1.5*i*1e-6);
+#set("y span",1e-6);
+#set("z",0e-6);
+#set("z span",1e-6);
+set("x min",6.5e-6);
+set("x max",7.5e-6);
+set("y",-4.75e-6+0.5*j*1e-6);
+set("y span",0.2e-6);
+set("z",0e-6);
+set("z span",0.22e-6);
+j=j+1;
+
+set("material","SiO2 (Glass) - Palik");
+addtogroup("::model::G1");
+}

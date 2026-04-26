@@ -1,0 +1,28 @@
+j = 1;
+for(i=1:10)
+{
+    # 添加圆孔
+    addcircle;
+    
+    # 设置圆孔的名称
+    set("name", "gra" + num2str(i));  
+    
+    # 设置圆孔的半径和深度
+    set("radius", 200e-9);  # 圆孔半径为200nm
+    set("z", 0e-6);  # 圆孔的位置在z=0
+    set("z span", 0.22e-6);  # 圆孔的深度为0.22um
+    
+    # 设置圆孔的x和y位置
+    set("x", 3e-6);  # x轴位置
+    set("y", -4.15e-6 + 0.75*j*1e-6);  # y轴位置（按间隔排列）
+    
+    
+    # 设置材料为二氧化硅（SiO2）
+    set("material", "SiO2 (Glass) - Palik");
+    
+    # 将圆孔加入到指定的模型组
+    addtogroup("::model::G1");
+    
+    # 更新j值
+    j = j + 1;
+}

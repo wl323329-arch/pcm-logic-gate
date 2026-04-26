@@ -1,0 +1,8 @@
+  switchtolayout;
+  select("source1"); set("phase", 180);   # 逻辑态4的相位，具体值看你的 train_data
+  select("source2"); set("phase", 180);
+  select("source3"); set("phase", 180);
+  run;
+
+  ?getdata("output1", "power");
+  ?getdata("output2", "power");
