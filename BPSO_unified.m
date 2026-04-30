@@ -28,7 +28,7 @@ train_data = train_data * pi;   % 将训练集数据加载到相位上
 
 %% 参数设置
 N1  = 1000;              % 阶段1种群规模
-N2  = 30;                % 阶段2种群规模
+N2  = 16;                % stage-2 true evaluations per generation
 d   = 49;                % 49个孔洞的二进制材料变量
 ger2 = 10;               % 首次运行阶段2基础代数
 N_SEED_TARGET = 5;       % 阶段1需要找到的全对结构数
@@ -37,9 +37,21 @@ CONTINUE_FROM_EXISTING_RESULTS = true;  % 自动导入 record_unified*.mat 作�
 START_STAGE2_WITH_IMPORTED_SEEDS = true;
 STAGE2_EXTRA_GENERATIONS_ON_RESUME = 20;
 MAX_IMPORTED_SEEDS = 200;
-LOCAL_SEARCH_BITS_PER_GEN = d;
-TWO_BIT_ELITE_TRIALS = 24;
 DUPLICATE_RETRY_LIMIT = 80;
+N_INIT_REEVAL = 80;
+N_CAND = 5000;
+K_TRUE = N2;
+ELITE_FRAC = 0.15;
+rho = 0.25;
+p_min = 0.05;
+p_max = 0.95;
+tau = 2.0;
+lambda_balance = 0.05;
+LOCAL_1BIT_EVAL = 10;
+LOCAL_2BIT_TOP_BITS = 12;
+LOCAL_2BIT_EVAL = 8;
+SURROGATE_MIN_SAMPLES = 60;
+STALL_RESET_GEN = 4;
 
 % 材料名（增量 set_slot 用）
 matA = 'A_Sb2Se3';   % 非晶态
@@ -48,7 +60,7 @@ matB = 'B_Sb2Se3';   % 晶态
 SAVE_FILE = fullfile(SCRIPT_DIR, 'record_unified.mat');
 NAMED_SAVE_FILE = fullfile(SCRIPT_DIR, ['record_unified' RESULT_TAG '.mat']);
 RESULT_PATTERNS = {SAVE_FILE, NAMED_SAVE_FILE, fullfile(SCRIPT_DIR, ['record_unified' RESULT_TAG '_*.mat'])};
-METRIC_VERSION = 2;  % v1 = 伪功率+20*log10, v2 = 透过率T+10*log10
+METRIC_VERSION = 3;  % v3 = full margins + soft archive score; best still uses true CR_worst
 
 %% 共享优化基础设施
 eval_cache = containers.Map('KeyType','char','ValueType','any');
@@ -60,9 +72,17 @@ cache_bits = zeros(0, d);
 cache_n_right = zeros(0, 1);
 cache_CR_worst = zeros(0, 1);
 cache_loss_mse = zeros(0, 1);
+cache_CR_each = zeros(0, size_train(1));
+cache_F_soft = zeros(0, 1);
+cache_worst_idx = zeros(0, 1);
+cache_is_full = false(0, 1);
 stage2_target_iter = ger2;
 stall_gen = 0;
 fym_prev = -inf;
+p_eda = 0.5 * ones(1, d);
+best_CR_each = nan(1, size_train(1));
+best_worst_idx = 0;
+init_reeval_queue = zeros(0, d);
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %% 断点续跑 / 首次运行初始化
@@ -117,10 +137,23 @@ if exist(SAVE_FILE, 'file')
             if isfield(S, 'cache_n_right'), cache_n_right = S.cache_n_right; end
             if isfield(S, 'cache_CR_worst'), cache_CR_worst = S.cache_CR_worst; end
             if isfield(S, 'cache_loss_mse'), cache_loss_mse = S.cache_loss_mse; end
+            if isfield(S, 'cache_CR_each'), cache_CR_each = S.cache_CR_each; end
+            if isfield(S, 'cache_F_soft'), cache_F_soft = S.cache_F_soft; end
+            if isfield(S, 'cache_worst_idx'), cache_worst_idx = S.cache_worst_idx; end
+            if isfield(S, 'cache_is_full'), cache_is_full = S.cache_is_full; end
             if isfield(S, 'stage2_target_iter'), stage2_target_iter = S.stage2_target_iter; end
             if isfield(S, 'stall_gen'), stall_gen = S.stall_gen; end
             if isfield(S, 'fym_prev'), fym_prev = S.fym_prev; end
-            eval_cache = rebuild_eval_cache(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse);
+            if isfield(S, 'p_eda'), p_eda = S.p_eda; end
+            if isfield(S, 'best_CR_each'), best_CR_each = S.best_CR_each; end
+            if isfield(S, 'best_worst_idx'), best_worst_idx = S.best_worst_idx; end
+            if isfield(S, 'init_reeval_queue'), init_reeval_queue = S.init_reeval_queue; end
+            [cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full] = ...
+                normalize_archive_fields(cache_bits, cache_n_right, cache_CR_worst, ...
+                                         cache_CR_each, cache_F_soft, cache_worst_idx, ...
+                                         cache_is_full, size_train(1), tau, lambda_balance);
+            eval_cache = rebuild_eval_cache(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
+                                            cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full);
 
             % 尺寸校验
             if phase == 1
@@ -145,6 +178,7 @@ end
 
 if ~resume_ok
     [seed_pool, seed_pool_cr] = import_existing_results(RESULT_PATTERNS, d, size_train(1), MAX_IMPORTED_SEEDS);
+    init_reeval_queue = collect_initial_reeval_candidates(RESULT_PATTERNS, d, N_INIT_REEVAL);
 
     if CONTINUE_FROM_EXISTING_RESULTS && START_STAGE2_WITH_IMPORTED_SEEDS && ~isempty(seed_pool)
         phase = 2;
@@ -177,6 +211,7 @@ if ~resume_ok
 
     iter = 1;
     num  = 1;
+    p_eda = initialize_eda_probability(seed_pool, d, p_min, p_max);
 end
 
 %% 打开 Lumerical（一次，两阶段共享）
@@ -207,10 +242,10 @@ if phase == 1
 
         L = x(num,:)';
 
-        [nr, crw, lmse, ~, cache_hit, early_stopped, last_bits] = ...
+        [nr, crw, lmse, CR_each_now, F_soft_now, worst_idx_now, cache_hit, early_stopped, last_bits] = ...
             eval_particle(h, L, eval_cache, last_bits, ...
                           train_data, train_target, size_train, size_target, ...
-                          matA, matB);
+                          matA, matB, tau, lambda_balance, false);
 
         n_right(num,1)  = nr;
         CR_worst(num,1) = crw;
@@ -223,9 +258,12 @@ if phase == 1
             stat_early_stop = stat_early_stop + 1;
         end
         if ~cache_hit
-            [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse] = ...
+            [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
+             cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full] = ...
                 append_cache_arrays(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
-                                    x(num,:), nr, crw, lmse);
+                                    cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full, ...
+                                    x(num,:), nr, crw, lmse, CR_each_now, F_soft_now, ...
+                                    worst_idx_now, nr == size_train(1));
         end
 
         % 适应度：n_right 优先，MSE 次之
@@ -293,7 +331,9 @@ if phase == 1
             'n_right', 'CR_worst', 'loss_mse', ...
             'particle_time_sec', 'iter', 'num', ...
             'cache_bits', 'cache_n_right', 'cache_CR_worst', 'cache_loss_mse', ...
+            'cache_CR_each', 'cache_F_soft', 'cache_worst_idx', 'cache_is_full', ...
             'stage2_target_iter', 'stall_gen', 'fym_prev', ...
+            'p_eda', 'best_CR_each', 'best_worst_idx', 'init_reeval_queue', ...
             '-v7.3');
 
         % 检查是否够种子了
@@ -321,6 +361,7 @@ if phase == 1
     [x, v, xm, fxm, fym, ym, n_right, CR_worst, loss_mse, ...
      particle_time_sec, record, record_time] = ...
         init_memetic_population(seed_pool, seed_pool_cr, N2, d);
+    p_eda = initialize_eda_probability(seed_pool, d, p_min, p_max);
 
     iter = 1;
     num  = 1;
@@ -334,16 +375,49 @@ if phase == 1
         'n_right', 'CR_worst', 'loss_mse', ...
         'particle_time_sec', 'iter', 'num', ...
         'cache_bits', 'cache_n_right', 'cache_CR_worst', 'cache_loss_mse', ...
+        'cache_CR_each', 'cache_F_soft', 'cache_worst_idx', 'cache_is_full', ...
         'stage2_target_iter', 'stall_gen', 'fym_prev', ...
+        'p_eda', 'best_CR_each', 'best_worst_idx', 'init_reeval_queue', ...
         '-v7.3');
 end
 
 %% ==================== 阶段2: 优化 ====================
 if phase == 2
-    fprintf('========== 阶段2: 种子继承 + Memetic 离散优化 (N=%d, target_iter=%d) ==========\n', ...
-        N2, stage2_target_iter);
+    fprintf('========== 阶段2: Archive + Surrogate + EDA (K_TRUE=%d, target_iter=%d) ==========\n', ...
+        K_TRUE, stage2_target_iter);
 
     while iter <= stage2_target_iter
+        if num == 1
+            if size(cache_bits, 1) >= SURROGATE_MIN_SAMPLES
+                surrogate = train_surrogate(cache_bits, cache_F_soft);
+            else
+                surrogate = [];
+            end
+
+            init_reeval_queue = remove_cached_candidates(init_reeval_queue, eval_cache);
+            if ~isempty(init_reeval_queue)
+                take_init = min(K_TRUE, size(init_reeval_queue, 1));
+                selected = init_reeval_queue(1:take_init, :);
+                init_reeval_queue = init_reeval_queue(take_init+1:end, :);
+                cand = selected;
+                fprintf('[archive bootstrap] queued %d historical candidates for full v3 evaluation.\n', take_init);
+            else
+                cand = generate_eda_candidates(p_eda, ym, d, N_CAND, stall_gen);
+                cand = remove_cached_candidates(cand, eval_cache);
+                if ~isempty(surrogate)
+                    selected = select_candidates_by_surrogate(cand, surrogate, ym, K_TRUE);
+                else
+                    selected = cand(1:min(K_TRUE, size(cand,1)), :);
+                end
+                if isempty(selected)
+                    selected = generate_eda_candidates(p_eda, ym, d, K_TRUE, stall_gen);
+                end
+            end
+            x = fill_stage2_population(selected, p_eda, ym, N2, d, eval_cache);
+            v = zeros(N2, d);
+            fprintf('[EDA] iter %d generated %d unique candidates, selected %d true evaluations.\n', ...
+                iter, size(cand, 1), size(selected, 1));
+        end
 
         while num <= N2
 
@@ -352,10 +426,10 @@ if phase == 2
 
             L = x(num,:)';
 
-            [nr, crw, lmse, ~, cache_hit, early_stopped, last_bits] = ...
+            [nr, crw, lmse, CR_each_now, F_soft_now, worst_idx_now, cache_hit, early_stopped, last_bits] = ...
                 eval_particle(h, L, eval_cache, last_bits, ...
                               train_data, train_target, size_train, size_target, ...
-                              matA, matB);
+                              matA, matB, tau, lambda_balance, true);
 
             n_right(num,1)  = nr;
             CR_worst(num,1) = crw;
@@ -368,18 +442,23 @@ if phase == 2
                 stat_early_stop = stat_early_stop + 1;
             end
             if ~cache_hit
-                [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse] = ...
+                [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
+                 cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full] = ...
                     append_cache_arrays(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
-                                        x(num,:), nr, crw, lmse);
+                                        cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full, ...
+                                        x(num,:), nr, crw, lmse, CR_each_now, F_soft_now, ...
+                                        worst_idx_now, nr == size_train(1));
             end
 
-            % 逐粒子更新个体最优和全局最优（以 CR_worst 为适应度）
+            % 逐粒子更新个体最优和全局最优（最终最优只用全对 CR_worst）
             if nr == size_train(1) && crw > fxm(num)
                 fxm(num) = crw;
                 xm(num,:) = x(num,:);
                 if fxm(num) > fym
                     fym = fxm(num);
                     ym = xm(num,:);
+                    best_CR_each = CR_each_now(:)';
+                    best_worst_idx = worst_idx_now;
                 end
             end
             if nr == size_train(1)
@@ -417,7 +496,9 @@ if phase == 2
                 'n_right', 'CR_worst', 'loss_mse', ...
                 'particle_time_sec', 'iter', 'num', ...
                 'cache_bits', 'cache_n_right', 'cache_CR_worst', 'cache_loss_mse', ...
+                'cache_CR_each', 'cache_F_soft', 'cache_worst_idx', 'cache_is_full', ...
                 'stage2_target_iter', 'stall_gen', 'fym_prev', ...
+                'p_eda', 'best_CR_each', 'best_worst_idx', 'init_reeval_queue', ...
                 '-v7.3');
 
             num = num + 1;
@@ -438,80 +519,59 @@ if phase == 2
         end
         fym_prev = fym;
 
-        %% 局部搜索：先扫 1-bit，停滞时增加 2-bit 扰动
-        if iter < stage2_target_iter
-            fprintf('[局部搜索] 1-bit 扫描 %d 个位置，停滞 %d 代。\n', LOCAL_SEARCH_BITS_PER_GEN, stall_gen);
+        %% 目标化局部搜索：代理模型排序后的 1-bit/2-bit 邻域
+        if iter < stage2_target_iter && size(cache_bits, 1) >= SURROGATE_MIN_SAMPLES
+            surrogate = train_surrogate(cache_bits, cache_F_soft);
+            selected_local = targeted_local_candidates(ym, surrogate, d, LOCAL_1BIT_EVAL, ...
+                                                       LOCAL_2BIT_TOP_BITS, LOCAL_2BIT_EVAL);
+            selected_local = remove_cached_candidates(selected_local, eval_cache);
+            fprintf('[targeted local] evaluating %d surrogate-ranked neighbors, stall=%d.\n', ...
+                size(selected_local, 1), stall_gen);
             local_improved = 0;
-            bit_order = randperm(d, min(LOCAL_SEARCH_BITS_PER_GEN, d));
 
-            for bit_i = bit_order
-                neighbor = ym;
-                neighbor(bit_i) = 1 - neighbor(bit_i);
+            for li = 1:size(selected_local, 1)
+                neighbor = selected_local(li, :);
 
                 stat_cache_total = stat_cache_total + 1;
 
-                [nb_nr, nb_crw, nb_lmse, ~, nb_cache_hit, ~, last_bits] = ...
+                [nb_nr, nb_crw, nb_lmse, nb_CR_each, nb_F_soft, nb_worst_idx, nb_cache_hit, nb_early_stopped, last_bits] = ...
                     eval_particle(h, neighbor', eval_cache, last_bits, ...
                                   train_data, train_target, size_train, size_target, ...
-                                  matA, matB);
+                                  matA, matB, tau, lambda_balance, true);
 
                 if nb_cache_hit
                     stat_cache_hit = stat_cache_hit + 1;
                 end
+                if nb_early_stopped
+                    stat_early_stop = stat_early_stop + 1;
+                end
                 if ~nb_cache_hit
-                    [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse] = ...
+                    [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
+                     cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full] = ...
                         append_cache_arrays(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
-                                            neighbor, nb_nr, nb_crw, nb_lmse);
+                                            cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full, ...
+                                            neighbor, nb_nr, nb_crw, nb_lmse, nb_CR_each, nb_F_soft, ...
+                                            nb_worst_idx, nb_nr == size_train(1));
                 end
 
                 if nb_nr == size_train(1) && nb_crw > fym
                     fym = nb_crw;
                     ym  = neighbor;
+                    best_CR_each = nb_CR_each(:)';
+                    best_worst_idx = nb_worst_idx;
                     local_improved = local_improved + 1;
                     [seed_pool, seed_pool_cr] = upsert_seed(seed_pool, seed_pool_cr, neighbor, nb_crw, MAX_IMPORTED_SEEDS);
-                    fprintf('  [局部搜索] bit %d 翻转改善! fym = %.6f dB\n', bit_i, fym);
+                    fprintf('  [targeted local] improved fym = %.6f dB, worst logic=%d\n', fym, best_worst_idx);
                 end
             end
-
-            if stall_gen >= 2
-                fprintf('[局部搜索] 2-bit 精英扰动 %d 次。\n', TWO_BIT_ELITE_TRIALS);
-                for trial_i = 1:TWO_BIT_ELITE_TRIALS
-                    neighbor = ym;
-                    bit_pair = randperm(d, 2);
-                    neighbor(bit_pair) = 1 - neighbor(bit_pair);
-
-                    stat_cache_total = stat_cache_total + 1;
-                    [nb_nr, nb_crw, nb_lmse, ~, nb_cache_hit, ~, last_bits] = ...
-                        eval_particle(h, neighbor', eval_cache, last_bits, ...
-                                      train_data, train_target, size_train, size_target, ...
-                                      matA, matB);
-                    if nb_cache_hit
-                        stat_cache_hit = stat_cache_hit + 1;
-                    else
-                        [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse] = ...
-                            append_cache_arrays(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
-                                                neighbor, nb_nr, nb_crw, nb_lmse);
-                    end
-
-                    if nb_nr == size_train(1) && nb_crw > fym
-                        fym = nb_crw;
-                        ym  = neighbor;
-                        local_improved = local_improved + 1;
-                        stall_gen = 0;
-                        [seed_pool, seed_pool_cr] = upsert_seed(seed_pool, seed_pool_cr, neighbor, nb_crw, MAX_IMPORTED_SEEDS);
-                        fprintf('  [2-bit] bits %d/%d 改善! fym = %.6f dB\n', bit_pair(1), bit_pair(2), fym);
-                    end
-                end
-            end
-            fprintf('[局部搜索] 完成，改善 %d 次，当前 fym = %.6f dB\n', local_improved, fym);
+            fprintf('[targeted local] done, improvements=%d, current fym=%.6f dB\n', local_improved, fym);
         end
 
-        %% 候选生成：精英交叉 + 自适应变异 + 已评估结构去重
-        if iter < stage2_target_iter
-            x = build_next_population(ym, xm, fxm, N2, d, iter, stage2_target_iter, ...
-                                      stall_gen, eval_cache, DUPLICATE_RETRY_LIMIT);
-            xm(1,:) = ym;
-            fxm(1) = fym;
+        p_eda = update_eda_probability(cache_bits, cache_CR_worst, cache_F_soft, cache_is_full, ...
+                                       p_eda, rho, ELITE_FRAC, p_min, p_max);
+        if stall_gen >= STALL_RESET_GEN
+            p_eda = min(max(0.85 * p_eda + 0.15 * 0.5, p_min), p_max);
+            fprintf('[EDA] probability annealed after %d stalled generations.\n', stall_gen);
         end
 
         % 重置每代指标
@@ -536,7 +596,9 @@ if phase == 2
             'n_right', 'CR_worst', 'loss_mse', ...
             'particle_time_sec', 'iter', 'num', ...
             'cache_bits', 'cache_n_right', 'cache_CR_worst', 'cache_loss_mse', ...
+            'cache_CR_each', 'cache_F_soft', 'cache_worst_idx', 'cache_is_full', ...
             'stage2_target_iter', 'stall_gen', 'fym_prev', ...
+            'p_eda', 'best_CR_each', 'best_worst_idx', 'init_reeval_queue', ...
             '-v7.3');
     end
 end
@@ -558,7 +620,9 @@ catch ME
             'n_right', 'CR_worst', 'loss_mse', ...
             'particle_time_sec', 'iter', 'num', ...
             'cache_bits', 'cache_n_right', 'cache_CR_worst', 'cache_loss_mse', ...
+            'cache_CR_each', 'cache_F_soft', 'cache_worst_idx', 'cache_is_full', ...
             'stage2_target_iter', 'stall_gen', 'fym_prev', ...
+            'p_eda', 'best_CR_each', 'best_worst_idx', 'init_reeval_queue', ...
             '-v7.3');
     catch
     end
@@ -595,7 +659,7 @@ for kk = 1:size_train(1)
         P_right = abs(p_final(kk,2));
         P_wrong = abs(p_final(kk,1));
     end
-    CR_verify(kk) = 10 * log10(abs(P_right / (P_wrong + eps_val)));
+    CR_verify(kk) = 10 * log10((P_right + eps_val) / (P_wrong + eps_val));
     fprintf('  CR_%d = %.4f dB\n', kk, CR_verify(kk));
 end
 fprintf('CR_worst (验证) = %.4f dB\n', min(CR_verify));
@@ -688,7 +752,7 @@ function [seed_pool, seed_pool_cr] = import_existing_results(patterns, d, n_logi
             continue;
         end
 
-        metric_ok = isfield(S, 'metric_version') && S.metric_version == 2;
+        metric_ok = isfield(S, 'metric_version') && any(S.metric_version == [2 3]);
 
         if isfield(S, 'seed_pool') && ~isempty(S.seed_pool)
             bits = double(S.seed_pool);
@@ -723,6 +787,61 @@ function [seed_pool, seed_pool_cr] = import_existing_results(patterns, d, n_logi
         [seed_pool_cr, idx] = sort(seed_pool_cr, 'descend');
         seed_pool = seed_pool(idx, :);
         fprintf('[INFO] 历史结果导入完成：%d 个唯一结构。\n', size(seed_pool, 1));
+    end
+end
+
+function cand = collect_initial_reeval_candidates(patterns, d, max_candidates)
+    cand = zeros(0, d);
+    if ischar(patterns) || isstring(patterns)
+        patterns = cellstr(patterns);
+    end
+    files = [];
+    for pi = 1:numel(patterns)
+        files = [files; dir(patterns{pi})]; %#ok<AGROW>
+    end
+    if isempty(files)
+        return;
+    end
+    file_paths = arrayfun(@(f) fullfile(f.folder, f.name), files, 'UniformOutput', false);
+    [~, unique_idx] = unique(file_paths, 'stable');
+    files = files(unique_idx);
+
+    for fi = 1:length(files)
+        file_path = fullfile(files(fi).folder, files(fi).name);
+        try
+            S = load(file_path);
+        catch
+            continue;
+        end
+        local_cand = zeros(0, d);
+        if isfield(S, 'ym') && numel(S.ym) == d
+            local_cand = [local_cand; double(S.ym(:)')]; %#ok<AGROW>
+        end
+        if isfield(S, 'seed_pool') && size(S.seed_pool, 2) == d
+            local_cand = [local_cand; double(S.seed_pool)]; %#ok<AGROW>
+        end
+        if isfield(S, 'cache_bits') && size(S.cache_bits, 2) == d
+            cb = double(S.cache_bits);
+            if isfield(S, 'cache_CR_worst') && numel(S.cache_CR_worst) == size(cb, 1)
+                [~, ord] = sort(double(S.cache_CR_worst(:)), 'descend');
+                cb = cb(ord, :);
+            end
+            local_cand = [local_cand; cb(1:min(size(cb, 1), max_candidates), :)]; %#ok<AGROW>
+        end
+        if isfield(S, 'record') && size(S.record, 2) >= d
+            rb = double(S.record(:, 1:d));
+            rb = rb(all(rb == 0 | rb == 1, 2), :);
+            local_cand = [local_cand; rb(1:min(size(rb, 1), max_candidates), :)]; %#ok<AGROW>
+        end
+        local_cand = local_cand(all(local_cand == 0 | local_cand == 1, 2), :);
+        cand = unique([cand; local_cand], 'rows', 'stable'); %#ok<AGROW>
+        if size(cand, 1) >= max_candidates
+            cand = cand(1:max_candidates, :);
+            break;
+        end
+    end
+    if ~isempty(cand)
+        fprintf('[INFO] 已建立 %d 个历史结构的 v3 完整重评估队列。\n', size(cand, 1));
     end
 end
 
@@ -780,7 +899,52 @@ function [x, v, xm, fxm, fym, ym, n_right, CR_worst, loss_mse, particle_time_sec
     record_time = repmat(string(datetime), N, 1);
 end
 
-function eval_cache = rebuild_eval_cache(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse)
+function [cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full] = ...
+        normalize_archive_fields(cache_bits, cache_n_right, cache_CR_worst, ...
+                                 cache_CR_each, cache_F_soft, cache_worst_idx, ...
+                                 cache_is_full, n_logic, tau, lambda_balance)
+    n = size(cache_bits, 1);
+    if size(cache_CR_each, 1) ~= n || size(cache_CR_each, 2) ~= n_logic
+        new_CR_each = nan(n, n_logic);
+        rows = min(size(cache_CR_each, 1), n);
+        cols = min(size(cache_CR_each, 2), n_logic);
+        if rows > 0 && cols > 0
+            new_CR_each(1:rows, 1:cols) = cache_CR_each(1:rows, 1:cols);
+        end
+        cache_CR_each = new_CR_each;
+    end
+    cache_F_soft = resize_col(cache_F_soft, n, -inf);
+    cache_worst_idx = resize_col(cache_worst_idx, n, 0);
+    cache_is_full = logical(resize_col(cache_is_full, n, false));
+
+    for i = 1:n
+        if all(isfinite(cache_CR_each(i,:)))
+            if ~isfinite(cache_F_soft(i))
+                cache_F_soft(i) = softmin_score(cache_CR_each(i,:)', tau, lambda_balance);
+            end
+            if cache_worst_idx(i) <= 0
+                [~, cache_worst_idx(i)] = min(cache_CR_each(i,:));
+            end
+        elseif cache_n_right(i) == n_logic && isfinite(cache_CR_worst(i))
+            cache_CR_each(i,:) = cache_CR_worst(i);
+            cache_F_soft(i) = softmin_score(cache_CR_each(i,:)', tau, lambda_balance);
+            cache_worst_idx(i) = 1;
+        end
+        cache_is_full(i) = cache_n_right(i) == n_logic && all(isfinite(cache_CR_each(i,:)));
+    end
+end
+
+function v = resize_col(v, n, fill_value)
+    v = v(:);
+    if length(v) < n
+        v(end+1:n, 1) = fill_value;
+    elseif length(v) > n
+        v = v(1:n);
+    end
+end
+
+function eval_cache = rebuild_eval_cache(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
+                                         cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full)
     eval_cache = containers.Map('KeyType','char','ValueType','any');
     for i = 1:size(cache_bits, 1)
         bits = cache_bits(i,:);
@@ -791,19 +955,31 @@ function eval_cache = rebuild_eval_cache(cache_bits, cache_n_right, cache_CR_wor
         ce.n_right = cache_n_right(i);
         ce.CR_worst = cache_CR_worst(i);
         ce.loss_mse = cache_loss_mse(i);
+        ce.CR_each = cache_CR_each(i,:)';
+        ce.F_soft = cache_F_soft(i);
+        ce.worst_idx = cache_worst_idx(i);
+        ce.is_full = cache_is_full(i);
         eval_cache(char(bits + '0')) = ce;
     end
 end
 
-function [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse] = ...
-        append_cache_arrays(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, bits, nr, crw, lmse)
+function [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
+          cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full] = ...
+        append_cache_arrays(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
+                            cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full, ...
+                            bits, nr, crw, lmse, CR_each, F_soft, worst_idx, is_full)
     bits = double(bits(:)');
     key = char(bits + '0');
+    CR_each = double(CR_each(:)');
     for i = 1:size(cache_bits, 1)
         if strcmp(char(cache_bits(i,:) + '0'), key)
             cache_n_right(i) = nr;
             cache_CR_worst(i) = crw;
             cache_loss_mse(i) = lmse;
+            cache_CR_each(i,:) = CR_each;
+            cache_F_soft(i) = F_soft;
+            cache_worst_idx(i) = worst_idx;
+            cache_is_full(i) = is_full;
             return;
         end
     end
@@ -811,6 +987,10 @@ function [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse] = ...
     cache_n_right = [cache_n_right; nr];
     cache_CR_worst = [cache_CR_worst; crw];
     cache_loss_mse = [cache_loss_mse; lmse];
+    cache_CR_each = [cache_CR_each; CR_each];
+    cache_F_soft = [cache_F_soft; F_soft];
+    cache_worst_idx = [cache_worst_idx; worst_idx];
+    cache_is_full = [cache_is_full; is_full];
 end
 
 function [seed_pool, seed_pool_cr] = upsert_seed(seed_pool, seed_pool_cr, bits, cr, max_seeds)
@@ -889,6 +1069,198 @@ function tf = row_exists(A, row)
     end
 end
 
+function p_eda = initialize_eda_probability(seed_pool, d, p_min, p_max)
+    if ~isempty(seed_pool)
+        p_eda = 0.6 * mean(double(seed_pool), 1) + 0.4 * 0.5;
+    else
+        p_eda = 0.5 * ones(1, d);
+    end
+    p_eda = min(max(p_eda, p_min), p_max);
+end
+
+function surrogate = train_surrogate(cache_bits, cache_F_soft)
+    surrogate = [];
+    ok = all(isfinite(cache_bits), 2) & isfinite(cache_F_soft(:));
+    X = double(cache_bits(ok, :));
+    y = double(cache_F_soft(ok));
+    if size(X, 1) < 10
+        return;
+    end
+    try
+        if exist('TreeBagger', 'file') == 2
+            surrogate = TreeBagger(120, X, y, ...
+                'Method', 'regression', ...
+                'OOBPrediction', 'on');
+        elseif exist('fitrensemble', 'file') == 2
+            surrogate = fitrensemble(X, y, 'Method', 'Bag');
+        end
+    catch ME
+        fprintf('[WARN] surrogate training failed: %s\n', ME.message);
+        surrogate = [];
+    end
+end
+
+function cand = generate_eda_candidates(p_eda, ym, d, N_CAND, stall_gen)
+    n_eda = round(0.60 * N_CAND);
+    n_local = round(0.25 * N_CAND);
+    n_rand = max(0, N_CAND - n_eda - n_local);
+
+    eda = double(rand(n_eda, d) < repmat(p_eda, n_eda, 1));
+    local = repmat(double(ym(:)'), n_local, 1);
+    max_flip = min(d, 4 + min(stall_gen, 4));
+    for i = 1:n_local
+        flip_count = randi([1, max_flip]);
+        flip_idx = randperm(d, flip_count);
+        local(i, flip_idx) = 1 - local(i, flip_idx);
+    end
+    random_part = double(rand(n_rand, d) > 0.5);
+    cand = unique([eda; local; random_part], 'rows', 'stable');
+end
+
+function cand = remove_cached_candidates(cand, eval_cache)
+    if isempty(cand)
+        return;
+    end
+    keep = true(size(cand, 1), 1);
+    for i = 1:size(cand, 1)
+        key = char(cand(i,:) + '0');
+        if eval_cache.isKey(key)
+            cached = eval_cache(key);
+            keep(i) = ~(isfield(cached, 'is_full') && cached.is_full);
+        end
+    end
+    cand = cand(keep, :);
+end
+
+function selected = select_candidates_by_surrogate(cand, surrogate, ym, K_TRUE)
+    if isempty(cand)
+        selected = zeros(0, numel(ym));
+        return;
+    end
+    pred_F = predict_surrogate(surrogate, cand);
+    hd = sum(abs(cand - repmat(ym, size(cand, 1), 1)), 2) / size(cand, 2);
+    acq = pred_F + 0.03 * hd;
+
+    n_top = min(size(cand, 1), max(1, round(0.70 * K_TRUE)));
+    n_mid = min(size(cand, 1) - n_top, max(0, round(0.20 * K_TRUE)));
+    n_rand = max(0, K_TRUE - n_top - n_mid);
+
+    [~, ord_acq] = sort(acq, 'descend');
+    pick = ord_acq(1:n_top);
+
+    mid_pool = find(hd >= 0.08 & hd <= 0.45);
+    mid_pool = setdiff(mid_pool, pick, 'stable');
+    if ~isempty(mid_pool) && n_mid > 0
+        [~, ord_mid] = sort(pred_F(mid_pool), 'descend');
+        pick = [pick; mid_pool(ord_mid(1:min(n_mid, numel(ord_mid))))]; %#ok<AGROW>
+    end
+
+    remain = setdiff((1:size(cand, 1))', pick, 'stable');
+    if ~isempty(remain) && n_rand > 0
+        rp = remain(randperm(numel(remain), min(n_rand, numel(remain))));
+        pick = [pick; rp]; %#ok<AGROW>
+    end
+
+    if numel(pick) < K_TRUE
+        remain = setdiff((1:size(cand, 1))', pick, 'stable');
+        pick = [pick; remain(1:min(K_TRUE - numel(pick), numel(remain)))]; %#ok<AGROW>
+    end
+    selected = cand(pick(1:min(K_TRUE, numel(pick))), :);
+end
+
+function pred = predict_surrogate(surrogate, X)
+    if isempty(surrogate)
+        pred = zeros(size(X, 1), 1);
+        return;
+    end
+    pred = predict(surrogate, double(X));
+    if iscell(pred)
+        pred = str2double(pred);
+    end
+    pred = double(pred(:));
+end
+
+function x = fill_stage2_population(selected, p_eda, ym, N, d, eval_cache)
+    x = zeros(N, d);
+    take_n = min(N, size(selected, 1));
+    if take_n > 0
+        x(1:take_n, :) = selected(1:take_n, :);
+    end
+    i = take_n + 1;
+    attempts = 0;
+    while i <= N
+        attempts = attempts + 1;
+        if rand < 0.7
+            trial = double(rand(1, d) < p_eda);
+        else
+            trial = ym;
+            flip_count = randi([1, min(4, d)]);
+            flip_idx = randperm(d, flip_count);
+            trial(flip_idx) = 1 - trial(flip_idx);
+        end
+        if ~eval_cache.isKey(char(trial + '0')) && ~row_exists(x(1:i-1,:), trial)
+            x(i,:) = trial;
+            i = i + 1;
+            attempts = 0;
+        elseif attempts > 50
+            x(i,:) = double(rand(1, d) > 0.5);
+            i = i + 1;
+            attempts = 0;
+        end
+    end
+end
+
+function p_eda = update_eda_probability(cache_bits, cache_CR_worst, cache_F_soft, cache_is_full, ...
+                                        p_eda, rho, elite_frac, p_min, p_max)
+    idx_full = find(cache_is_full);
+    if numel(idx_full) >= 10
+        pool_idx = idx_full;
+        score = cache_CR_worst(pool_idx);
+    else
+        pool_idx = (1:size(cache_bits, 1))';
+        score = cache_F_soft(pool_idx);
+    end
+    ok = isfinite(score);
+    pool_idx = pool_idx(ok);
+    score = score(ok);
+    if isempty(pool_idx)
+        return;
+    end
+    [~, ord] = sort(score, 'descend');
+    n_elite = min(numel(ord), max(8, round(elite_frac * numel(pool_idx))));
+    elite_bits = cache_bits(pool_idx(ord(1:n_elite)), :);
+    p_new = mean(elite_bits, 1);
+    p_eda = (1 - rho) * p_eda + rho * p_new;
+    p_eda = min(max(p_eda, p_min), p_max);
+end
+
+function selected_local = targeted_local_candidates(ym, surrogate, d, K1, K2_TOP_BITS, K2)
+    nei1 = repmat(ym, d, 1);
+    for b = 1:d
+        nei1(b,b) = 1 - nei1(b,b);
+    end
+    pred1 = predict_surrogate(surrogate, nei1);
+    [~, ord1] = sort(pred1, 'descend');
+    take1 = min(K1, numel(ord1));
+    eval_1bit = nei1(ord1(1:take1), :);
+
+    top_bits = ord1(1:min(K2_TOP_BITS, numel(ord1)));
+    if numel(top_bits) >= 2
+        pairs = nchoosek(top_bits, 2);
+        nei2 = repmat(ym, size(pairs, 1), 1);
+        for i = 1:size(pairs, 1)
+            nei2(i,pairs(i,1)) = 1 - nei2(i,pairs(i,1));
+            nei2(i,pairs(i,2)) = 1 - nei2(i,pairs(i,2));
+        end
+        pred2 = predict_surrogate(surrogate, nei2);
+        [~, ord2] = sort(pred2, 'descend');
+        eval_2bit = nei2(ord2(1:min(K2, numel(ord2))), :);
+    else
+        eval_2bit = zeros(0, d);
+    end
+    selected_local = unique([eval_1bit; eval_2bit], 'rows', 'stable');
+end
+
 function last_bits = do_incremental_set(h, L, last_bits, matA, matB)
 % 增量 set_slot：只更新变化的孔洞材料，减少 Lumerical 脚本执行量
     cur_bits = L;
@@ -916,23 +1288,50 @@ function last_bits = do_incremental_set(h, L, last_bits, matA, matB)
     last_bits = cur_bits;
 end
 
-function [nr, crw, lmse, p, cache_hit, early_stopped, last_bits] = ...
+function [nr, crw, lmse, CR_each, F_soft, worst_idx, cache_hit, early_stopped, last_bits] = ...
         eval_particle(h, L, eval_cache, last_bits, ...
                       train_data, train_target, size_train, size_target, ...
-                      matA, matB)
-% 评估单个粒子：缓存 → 增量set_slot → 逐逻辑态仿真+早停 → CR计算
+                      matA, matB, tau, lambda_balance, full_eval)
+% Evaluate one particle. Stage 2 should pass full_eval=true so every logic
+% state contributes a continuous margin to the archive/surrogate.
+    if nargin < 11
+        tau = 2.0;
+    end
+    if nargin < 12
+        lambda_balance = 0.05;
+    end
+    if nargin < 13
+        full_eval = false;
+    end
     cache_hit = false;
     early_stopped = false;
     cache_key = char(L' + '0');
 
     if eval_cache.isKey(cache_key)
         cached = eval_cache(cache_key);
-        p    = cached.p;
-        nr   = cached.n_right;
-        crw  = cached.CR_worst;
-        lmse = cached.loss_mse;
-        cache_hit = true;
-        return;
+        cached_is_full = isfield(cached, 'is_full') && cached.is_full;
+        if ~full_eval || cached_is_full
+            nr   = cached.n_right;
+            crw  = cached.CR_worst;
+            lmse = cached.loss_mse;
+            if isfield(cached, 'CR_each') && numel(cached.CR_each) == size_train(1)
+                CR_each = cached.CR_each(:);
+            else
+                CR_each = nan(size_train(1), 1);
+            end
+            if isfield(cached, 'F_soft')
+                F_soft = cached.F_soft;
+            else
+                F_soft = softmin_score(CR_each, tau, lambda_balance);
+            end
+            if isfield(cached, 'worst_idx')
+                worst_idx = cached.worst_idx;
+            else
+                [~, worst_idx] = min(CR_each);
+            end
+            cache_hit = true;
+            return;
+        end
     end
 
     % 增量 set_slot
@@ -940,50 +1339,76 @@ function [nr, crw, lmse, p, cache_hit, early_stopped, last_bits] = ...
 
     p = zeros(size_target);
     eps_val = 1e-30;
+    CR_each = nan(size_train(1), 1);
+    correct_vec = false(size_train(1), 1);
 
     % 逐逻辑态仿真 + 早停
     for tt = 1:size_train(1)
         phs = train_data(tt,:) * 180/pi;
         p(tt,:) = train_out(h, phs);
 
-        correct_so_far = sum(double((p(1:tt,1) > p(1:tt,2)) == ...
-                                    (train_target(1:tt,1) > train_target(1:tt,2))));
-        if tt - correct_so_far > 0
+        if train_target(tt,1) > train_target(tt,2)
+            P_right = abs(p(tt,1));
+            P_wrong = abs(p(tt,2));
+        else
+            P_right = abs(p(tt,2));
+            P_wrong = abs(p(tt,1));
+        end
+        CR_each(tt) = 10 * log10((P_right + eps_val) / (P_wrong + eps_val));
+        correct_vec(tt) = (p(tt,1) > p(tt,2)) == (train_target(tt,1) > train_target(tt,2));
+
+        correct_so_far = sum(double(correct_vec(1:tt)));
+        if ~full_eval && tt - correct_so_far > 0
             early_stopped = true;
             nr   = correct_so_far;
-            crw  = 0;
+            crw  = min(CR_each(1:tt));
+            [~, worst_idx] = min(CR_each(1:tt));
+            F_soft = -inf;
             p(tt+1:end,:) = NaN;  % 未仿真行标记为 NaN，避免误用
             p_clean = p;
             p_clean(isnan(p_clean)) = 0;
             p_norm = p_clean / (max(p_clean,[],"all") + eps_val);
             lmse = sumsqr(p_norm - train_target);
             % 写入缓存
-            ce.p = p; ce.n_right = nr; ce.CR_worst = crw; ce.loss_mse = lmse;
+            ce.p = p;
+            ce.n_right = nr;
+            ce.CR_worst = crw;
+            ce.loss_mse = lmse;
+            ce.CR_each = CR_each;
+            ce.F_soft = F_soft;
+            ce.worst_idx = worst_idx;
+            ce.is_full = false;
             eval_cache(cache_key) = ce;
             return;
         end
     end
 
-    % 全部正确
-    nr = size_train(1);
-    CR_each = zeros(size_train(1), 1);
-    for kk = 1:size_train(1)
-        if train_target(kk,1) > train_target(kk,2)
-            P_right = abs(p(kk,1));
-            P_wrong = abs(p(kk,2));
-        else
-            P_right = abs(p(kk,2));
-            P_wrong = abs(p(kk,1));
-        end
-        % 透过率 T 为功率比，使用 10*log10 计算 dB
-        CR_each(kk) = 10 * log10(abs(P_right / (P_wrong + eps_val)));
-    end
+    nr = sum(double(correct_vec));
     crw = min(CR_each);
+    [~, worst_idx] = min(CR_each);
+    F_soft = softmin_score(CR_each, tau, lambda_balance);
 
     p_norm = p / (max(p,[],"all") + eps_val);
     lmse = sumsqr(p_norm - train_target);
 
     % 写入缓存
-    ce.p = p; ce.n_right = nr; ce.CR_worst = crw; ce.loss_mse = lmse;
+    ce.p = p;
+    ce.n_right = nr;
+    ce.CR_worst = crw;
+    ce.loss_mse = lmse;
+    ce.CR_each = CR_each;
+    ce.F_soft = F_soft;
+    ce.worst_idx = worst_idx;
+    ce.is_full = true;
     eval_cache(cache_key) = ce;
+end
+
+function F = softmin_score(CR_each, tau, lambda_balance)
+    vals = double(CR_each(:));
+    vals = vals(isfinite(vals));
+    if isempty(vals)
+        F = -inf;
+        return;
+    end
+    F = -tau * log(sum(exp(-vals / tau))) - lambda_balance * std(vals);
 end
