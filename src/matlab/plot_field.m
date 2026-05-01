@@ -13,7 +13,7 @@ RESULTS_DIR = fullfile(PROJECT_DIR, 'results');
 STRUCTURE_DIR = fullfile(PROJECT_DIR, 'structure');
 SIM_FILE = fullfile(STRUCTURE_DIR, 'logic_mode.lms');
 
-setenv('PATH', [getenv('PATH') ';' LUM_BIN]);
+setenv('PATH', append_path_once(getenv('PATH'), LUM_BIN));
 addpath(LUM_API);
 addpath(SCRIPT_DIR);
 
@@ -32,11 +32,7 @@ phs = train_data(logic_idx, :) * 180/pi;
 fprintf('绘制逻辑态 %d, 相位 = [%.1f, %.1f, %.1f] deg\n', logic_idx, phs);
 
 %% 打开 Lumerical MODE
-h = appopen('mode');
-[sim_file_path, sim_file_name, ~] = fileparts(SIM_FILE);
-appputvar(h, 'sim_file_path', sim_file_path);
-appputvar(h, 'sim_file_name', sim_file_name);
-appevalscript(h, strcat('cd(sim_file_path);', 'load(sim_file_name);'));
+h = open_lumerical_mode(SIM_FILE);
 
 %% 设置最优结构材料
 set_slot(h, ym');

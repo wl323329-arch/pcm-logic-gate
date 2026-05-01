@@ -13,7 +13,7 @@ RESULTS_DIR = fullfile(PROJECT_DIR, 'results');
 STRUCTURE_DIR = fullfile(PROJECT_DIR, 'structure');
 SIM_FILE = fullfile(STRUCTURE_DIR, 'logic_mode.lms');
 
-setenv('PATH', [getenv('PATH') ';' LUM_BIN]);
+setenv('PATH', append_path_once(getenv('PATH'), LUM_BIN));
 addpath(LUM_API);
 addpath(SCRIPT_DIR);
 
@@ -556,7 +556,7 @@ end
 %% ==================== 输出最优结果 ====================
 fprintf('\n===== 最优结构验证 =====\n');
 cleanup_lumerical_constant(lum_workers);
-h = open_lumerical_handle(SIM_FILE);
+h = open_lumerical_mode(SIM_FILE);
 L = ym';
 set_slot(h, L);
 
@@ -1257,6 +1257,10 @@ function attach_parallel_files(pool, script_dir)
         fullfile(script_dir, 'make_lumerical_worker_session.m'), ...
         fullfile(script_dir, 'close_lumerical_worker_session.m'), ...
         fullfile(script_dir, 'worker_eval_particle.m'), ...
+        fullfile(script_dir, 'append_path_once.m'), ...
+        fullfile(script_dir, 'make_eval_result.m'), ...
+        fullfile(script_dir, 'open_lumerical_mode.m'), ...
+        fullfile(script_dir, 'softmin_score.m'), ...
         fullfile(script_dir, 'set_slot.m'), ...
         fullfile(script_dir, 'train_out.m')};
     files = files(cellfun(@(f) exist(f, 'file') == 2, files));
@@ -1330,29 +1334,24 @@ function results = run_parallel_eval_batch(lum_workers, candidates, eval_cache, 
 end
 
 function result = result_from_cache(cached, n_logic, tau, lambda_balance)
-    result = struct();
-    result.n_right = cached.n_right;
-    result.CR_worst = cached.CR_worst;
-    result.loss_mse = cached.loss_mse;
     if isfield(cached, 'CR_each') && numel(cached.CR_each) == n_logic
-        result.CR_each = cached.CR_each(:);
+        CR_each = cached.CR_each(:);
     else
-        result.CR_each = nan(n_logic, 1);
+        CR_each = nan(n_logic, 1);
     end
     if isfield(cached, 'F_soft')
-        result.F_soft = cached.F_soft;
+        F_soft = cached.F_soft;
     else
-        result.F_soft = softmin_score(result.CR_each, tau, lambda_balance);
+        F_soft = softmin_score(CR_each, tau, lambda_balance);
     end
     if isfield(cached, 'worst_idx')
-        result.worst_idx = cached.worst_idx;
+        worst_idx = cached.worst_idx;
     else
-        [~, result.worst_idx] = min(result.CR_each);
+        [~, worst_idx] = min(CR_each);
     end
-    result.is_full = isfield(cached, 'is_full') && cached.is_full;
-    result.cache_hit = true;
-    result.early_stopped = false;
-    result.duration_sec = 0;
+    is_full = isfield(cached, 'is_full') && cached.is_full;
+    result = make_eval_result(cached.n_right, cached.CR_worst, cached.loss_mse, ...
+        CR_each, F_soft, worst_idx, is_full, true, false, 0);
 end
 
 function eval_cache = store_eval_cache(eval_cache, bits, result)
@@ -1366,15 +1365,6 @@ function eval_cache = store_eval_cache(eval_cache, bits, result)
     ce.worst_idx = result.worst_idx;
     ce.is_full = result.is_full;
     eval_cache(char(double(bits(:)') + '0')) = ce;
-end
-
-function h = open_lumerical_handle(sim_file)
-    [sim_file_path, sim_file_name, ~] = fileparts(sim_file);
-    h = appopen('mode');
-    assert(~isempty(h), 'Failed to open MODE.');
-    appputvar(h, 'sim_file_path', sim_file_path);
-    appputvar(h, 'sim_file_name', sim_file_name);
-    appevalscript(h, strcat('cd(sim_file_path);', 'load(sim_file_name);'));
 end
 
 function cleanup_lumerical_constant(lum_workers)
@@ -1435,16 +1425,6 @@ function selected_local = targeted_local_candidates(ym, surrogate, d, K1, K2_TOP
     end
 
     selected_local = unique([eval_1bit; eval_2bit; eval_3bit], 'rows', 'stable');
-end
-
-function F = softmin_score(CR_each, tau, lambda_balance)
-    vals = double(CR_each(:));
-    vals = vals(isfinite(vals));
-    if isempty(vals)
-        F = -inf;
-        return;
-    end
-    F = -tau * log(sum(exp(-vals / tau))) - lambda_balance * std(vals);
 end
 
 function save_checkpoint(save_file)

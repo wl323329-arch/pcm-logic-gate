@@ -16,13 +16,7 @@ classdef LumericalWorkerSession < handle
             obj.matB = matB;
             obj.last_bits = nan(d, 1);
 
-            [sim_file_path, sim_file_name, ~] = fileparts(sim_file);
-            obj.h = appopen('mode');
-            assert(~isempty(obj.h), 'Failed to open MODE on worker.');
-
-            appputvar(obj.h, 'sim_file_path', sim_file_path);
-            appputvar(obj.h, 'sim_file_name', sim_file_name);
-            appevalscript(obj.h, strcat('cd(sim_file_path);', 'load(sim_file_name);'));
+            obj.h = open_lumerical_mode(sim_file);
         end
 
         function delete(obj)
@@ -33,10 +27,6 @@ classdef LumericalWorkerSession < handle
                 end
                 obj.h = [];
             end
-        end
-
-        function resetLastBits(obj)
-            obj.last_bits = nan(size(obj.last_bits));
         end
 
         function result = evalParticle(obj, L, train_data, train_target, size_train, size_target, tau, lambda_balance, full_eval)
@@ -84,7 +74,7 @@ classdef LumericalWorkerSession < handle
             nr = sum(double(correct_vec));
             crw = min(CR_each);
             [~, worst_idx] = min(CR_each);
-            F_soft = softmin_score_local(CR_each, tau, lambda_balance);
+            F_soft = softmin_score(CR_each, tau, lambda_balance);
             p_norm = p / (max(p, [], "all") + eps_val);
             lmse = sumsqr(p_norm - train_target);
 
@@ -120,42 +110,4 @@ classdef LumericalWorkerSession < handle
             obj.last_bits = cur_bits;
         end
     end
-end
-
-function path_value = append_path_once(path_value, folder)
-if isempty(folder)
-    return;
-end
-parts = split(string(path_value), pathsep);
-if ~any(strcmpi(parts, string(folder)))
-    if isempty(path_value)
-        path_value = folder;
-    else
-        path_value = [path_value pathsep folder];
-    end
-end
-end
-
-function result = make_eval_result(nr, crw, lmse, CR_each, F_soft, worst_idx, is_full, cache_hit, early_stopped, duration_sec)
-result = struct();
-result.n_right = nr;
-result.CR_worst = crw;
-result.loss_mse = lmse;
-result.CR_each = CR_each(:);
-result.F_soft = F_soft;
-result.worst_idx = worst_idx;
-result.is_full = is_full;
-result.cache_hit = cache_hit;
-result.early_stopped = early_stopped;
-result.duration_sec = duration_sec;
-end
-
-function F = softmin_score_local(CR_each, tau, lambda_balance)
-vals = double(CR_each(:));
-vals = vals(isfinite(vals));
-if isempty(vals)
-    F = -inf;
-    return;
-end
-F = -tau * log(sum(exp(-vals / tau))) - lambda_balance * std(vals);
 end

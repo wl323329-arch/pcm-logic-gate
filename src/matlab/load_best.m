@@ -13,7 +13,7 @@ RESULTS_DIR = fullfile(PROJECT_DIR, 'results');
 STRUCTURE_DIR = fullfile(PROJECT_DIR, 'structure');
 SIM_FILE = fullfile(STRUCTURE_DIR, 'logic_mode.lms');
 
-setenv('PATH', [getenv('PATH') ';' LUM_BIN]);
+setenv('PATH', append_path_once(getenv('PATH'), LUM_BIN));
 addpath(LUM_API);
 addpath(SCRIPT_DIR);
 
@@ -24,11 +24,7 @@ fprintf('最优结构: %s\n', char(ym + '0'));
 fprintf('fym = %.4f dB\n', S.fym);
 
 %% 打开 Lumerical MODE 并加载仿真文件
-h = appopen('mode');
-[sim_file_path, sim_file_name, ~] = fileparts(SIM_FILE);
-appputvar(h, 'sim_file_path', sim_file_path);
-appputvar(h, 'sim_file_name', sim_file_name);
-appevalscript(h, strcat('cd(sim_file_path);', 'load(sim_file_name);'));
+h = open_lumerical_mode(SIM_FILE);
 
 %% 设置最优结构材料
 set_slot(h, ym');
