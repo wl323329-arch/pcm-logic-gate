@@ -7,18 +7,26 @@ SCRIPT_DIR = fileparts(mfilename('fullpath'));
 if isempty(SCRIPT_DIR)
     SCRIPT_DIR = pwd;
 end
-SIM_FILE = fullfile(SCRIPT_DIR, '1.structure', 'logic_mode.lms');
+PROJECT_DIR = fileparts(fileparts(SCRIPT_DIR));
+DATA_DIR = fullfile(PROJECT_DIR, 'data');
+RESULTS_DIR = fullfile(PROJECT_DIR, 'results');
+STRUCTURE_DIR = fullfile(PROJECT_DIR, 'structure');
+SIM_FILE = fullfile(STRUCTURE_DIR, 'logic_mode.lms');
 
 setenv('PATH', [getenv('PATH') ';' LUM_BIN]);
 addpath(LUM_API);
+addpath(SCRIPT_DIR);
 
 assert(exist(SIM_FILE, 'file') == 2, 'Simulation file not found: %s', SIM_FILE);
-assert(exist(fullfile(SCRIPT_DIR, 'train_data.mat'), 'file') == 2, 'Missing train_data.mat in %s', SCRIPT_DIR);
-assert(exist(fullfile(SCRIPT_DIR, 'train_target.mat'), 'file') == 2, 'Missing train_target.mat in %s', SCRIPT_DIR);
+assert(exist(fullfile(DATA_DIR, 'train_data.mat'), 'file') == 2, 'Missing train_data.mat in %s', DATA_DIR);
+assert(exist(fullfile(DATA_DIR, 'train_target.mat'), 'file') == 2, 'Missing train_target.mat in %s', DATA_DIR);
+if exist(RESULTS_DIR, 'dir') ~= 7
+    mkdir(RESULTS_DIR);
+end
 
 %% 加载数据集及初始化
-load(fullfile(SCRIPT_DIR, 'train_data.mat'));
-load(fullfile(SCRIPT_DIR, 'train_target.mat'));
+load(fullfile(DATA_DIR, 'train_data.mat'));
+load(fullfile(DATA_DIR, 'train_target.mat'));
 
 size_train  = size(train_data);
 size_target = size(train_target);
@@ -57,9 +65,9 @@ STALL_RESET_GEN = 4;
 matA = 'A_Sb2Se3';   % 非晶态
 matB = 'B_Sb2Se3';   % 晶态
 
-SAVE_FILE = fullfile(SCRIPT_DIR, 'record_unified.mat');
-NAMED_SAVE_FILE = fullfile(SCRIPT_DIR, ['record_unified' RESULT_TAG '.mat']);
-RESULT_PATTERNS = {SAVE_FILE, NAMED_SAVE_FILE, fullfile(SCRIPT_DIR, ['record_unified' RESULT_TAG '_*.mat'])};
+SAVE_FILE = fullfile(RESULTS_DIR, 'record_unified.mat');
+NAMED_SAVE_FILE = fullfile(RESULTS_DIR, ['record_unified' RESULT_TAG '.mat']);
+RESULT_PATTERNS = {SAVE_FILE, NAMED_SAVE_FILE, fullfile(RESULTS_DIR, ['record_unified' RESULT_TAG '_*.mat'])};
 METRIC_VERSION = 3;  % v3 = full margins + soft archive score; best still uses true CR_worst
 
 %% 共享优化基础设施

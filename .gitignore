@@ -1,15 +1,18 @@
-# Lumerical MODE Solutions 文件（二进制，太大不适合git）
+# Lumerical MODE binary/local files
 *.lms
 *.ldev
 *.mdf
 
-# MATLAB 数据和临时文件
+# MATLAB data, logs, and editor backups
 *.mat
 *.asv
 *.log
 BPSO_temp_run.m
 
-# AI优化器临时文件（每次运行重新生成）
+# Automation output
+automation_logs/
+
+# AI optimizer generated files
 ai_optimizer/params/bpso_result.json
 ai_optimizer/params/bpso_config.json
 ai_optimizer/params/modify_structure.lsf
@@ -21,12 +24,12 @@ __pycache__/
 *.pyc
 .venv/
 
-# autoresearch (独立git仓库)
+# Separate local repository
 autoresearch/
 
-# 系统文件
+# System files
 .DS_Store
 Thumbs.db
 
-# OMC状态文件
+# OMC state
 .omc/

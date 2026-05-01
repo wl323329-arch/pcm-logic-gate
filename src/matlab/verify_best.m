@@ -7,15 +7,20 @@ SCRIPT_DIR = fileparts(mfilename('fullpath'));
 if isempty(SCRIPT_DIR)
     SCRIPT_DIR = pwd;
 end
-SIM_FILE = fullfile(SCRIPT_DIR, '1.structure', 'logic_mode.lms');
+PROJECT_DIR = fileparts(fileparts(SCRIPT_DIR));
+DATA_DIR = fullfile(PROJECT_DIR, 'data');
+RESULTS_DIR = fullfile(PROJECT_DIR, 'results');
+STRUCTURE_DIR = fullfile(PROJECT_DIR, 'structure');
+SIM_FILE = fullfile(STRUCTURE_DIR, 'logic_mode.lms');
 
 setenv('PATH', [getenv('PATH') ';' LUM_BIN]);
 addpath(LUM_API);
+addpath(SCRIPT_DIR);
 
 %% 加载最优结构和训练数据
-S = load(fullfile(SCRIPT_DIR, 'record_unified.mat'), 'ym', 'fym', 'seed_pool', 'seed_pool_cr');
-load(fullfile(SCRIPT_DIR, 'train_data.mat'));
-load(fullfile(SCRIPT_DIR, 'train_target.mat'));
+S = load(fullfile(RESULTS_DIR, 'record_unified.mat'), 'ym', 'fym', 'seed_pool', 'seed_pool_cr');
+load(fullfile(DATA_DIR, 'train_data.mat'));
+load(fullfile(DATA_DIR, 'train_target.mat'));
 
 train_data = train_data * pi;   % 与 BPSO_unified 一致
 

@@ -2,20 +2,33 @@
 
 MATLAB and Lumerical MODE scripts for binary-material PCM logic-gate optimization.
 
-## Main scripts
+## Layout
 
-- `BPSO_unified.m` - two-stage BPSO/memetic optimization loop.
-- `verify_best.m` - verifies the current best saved structure.
-- `load_best.m` - loads the current best structure into Lumerical MODE.
-- `set_slot.m` and `train_out.m` - Lumerical helper functions.
+- `src/matlab/` - active MATLAB optimization, verification, loading, plotting, and helper functions.
+- `structure/` - local Lumerical MODE structure files and generated field data.
+- `data/` - training input and target data.
+- `results/` - current optimization checkpoints and named gate results.
+- `results/archive/` - older result files kept for reference.
+- `scripts/lumerical/` - Lumerical script helpers.
+- `tests/` - lightweight MATLAB structural checks.
+- `legacy/` - older scripts kept for reference, not part of the active workflow.
 
-## Data not committed
+## Main Scripts
 
-Large simulation files and generated results are intentionally ignored:
+- `src/matlab/BPSO_unified.m` - two-stage BPSO/memetic optimization loop.
+- `src/matlab/verify_best.m` - verifies the current best saved structure.
+- `src/matlab/load_best.m` - loads the current best structure into Lumerical MODE.
+- `src/matlab/plot_field.m` - plots field data from the current best structure.
+- `src/matlab/set_slot.m` and `src/matlab/train_out.m` - Lumerical helper functions.
+
+## Local Data
+
+Large simulation files and generated results are intentionally ignored by Git:
 
 - `*.lms`
 - `*.mat`
+- `*.mdf`
 - `*.log`
 - `*.asv`
 
-Keep local result checkpoints such as `record_unified.mat` and named gate results outside Git.
+Keep active checkpoints in `results/`, training datasets in `data/`, and Lumerical files in `structure/`.

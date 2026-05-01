@@ -7,13 +7,18 @@ SCRIPT_DIR = fileparts(mfilename('fullpath'));
 if isempty(SCRIPT_DIR)
     SCRIPT_DIR = pwd;
 end
-SIM_FILE = fullfile(SCRIPT_DIR, '1.structure', 'logic_mode.lms');
+PROJECT_DIR = fileparts(fileparts(SCRIPT_DIR));
+DATA_DIR = fullfile(PROJECT_DIR, 'data');
+RESULTS_DIR = fullfile(PROJECT_DIR, 'results');
+STRUCTURE_DIR = fullfile(PROJECT_DIR, 'structure');
+SIM_FILE = fullfile(STRUCTURE_DIR, 'logic_mode.lms');
 
 setenv('PATH', [getenv('PATH') ';' LUM_BIN]);
 addpath(LUM_API);
+addpath(SCRIPT_DIR);
 
 %% 加载最优结构
-S = load(fullfile(SCRIPT_DIR, 'record_unified.mat'), 'ym', 'fym');
+S = load(fullfile(RESULTS_DIR, 'record_unified.mat'), 'ym', 'fym');
 ym = S.ym;
 fprintf('最优结构: %s\n', char(ym + '0'));
 fprintf('fym = %.4f dB\n', S.fym);
@@ -29,8 +34,8 @@ appevalscript(h, strcat('cd(sim_file_path);', 'load(sim_file_name);'));
 set_slot(h, ym');
 
 %% 加载训练数据
-load(fullfile(SCRIPT_DIR, 'train_data.mat'));
-load(fullfile(SCRIPT_DIR, 'train_target.mat'));
+load(fullfile(DATA_DIR, 'train_data.mat'));
+load(fullfile(DATA_DIR, 'train_target.mat'));
 train_data = train_data * pi;
 
 fprintf('已将最优结构导入 Lumerical。\n\n');

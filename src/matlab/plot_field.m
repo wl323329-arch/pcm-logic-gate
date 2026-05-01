@@ -4,18 +4,22 @@ clear all; close all; clc;
 LUM_BIN  = 'D:\Program Files\Lumerical\v231\bin';
 LUM_API  = 'D:\Program Files\Lumerical\v231\api\matlab';
 SCRIPT_DIR = fileparts(mfilename('fullpath'));
-PROJECT_DIR = fileparts(SCRIPT_DIR);
-if isempty(PROJECT_DIR)
-    PROJECT_DIR = pwd;
+if isempty(SCRIPT_DIR)
+    SCRIPT_DIR = pwd;
 end
-SIM_FILE = fullfile(PROJECT_DIR, '1.structure', 'logic_mode.lms');
+PROJECT_DIR = fileparts(fileparts(SCRIPT_DIR));
+DATA_DIR = fullfile(PROJECT_DIR, 'data');
+RESULTS_DIR = fullfile(PROJECT_DIR, 'results');
+STRUCTURE_DIR = fullfile(PROJECT_DIR, 'structure');
+SIM_FILE = fullfile(STRUCTURE_DIR, 'logic_mode.lms');
 
 setenv('PATH', [getenv('PATH') ';' LUM_BIN]);
 addpath(LUM_API);
+addpath(SCRIPT_DIR);
 
 %% 加载最优结构和训练数据
-S = load(fullfile(PROJECT_DIR, 'record_unified.mat'), 'ym');
-load(fullfile(PROJECT_DIR, 'train_data.mat'));
+S = load(fullfile(RESULTS_DIR, 'record_unified.mat'), 'ym');
+load(fullfile(DATA_DIR, 'train_data.mat'));
 train_data = train_data * pi;
 
 ym = S.ym;
@@ -56,7 +60,7 @@ code = strcat(...
 appevalscript(h, code);
 
 %% 加载场数据并绘图
-load(fullfile(PROJECT_DIR, '1.structure', 'field_data.mat'));
+load(fullfile(STRUCTURE_DIR, 'field_data.mat'));
 
 % A.E 是展平的 [N, 3]，3列分别是 Ex, Ey, Ez
 % 需要用 A.x, A.y 重建二维网格
@@ -85,7 +89,7 @@ for si = 1:3
 end
 
 % 输出标签：根据 train_target 判断哪个输出是 '1'
-load(fullfile(PROJECT_DIR, 'train_target.mat'));
+load(fullfile(DATA_DIR, 'train_target.mat'));
 if train_target(logic_idx, 1) > train_target(logic_idx, 2)
     out_label = '''1''';   % output1 更强
 else

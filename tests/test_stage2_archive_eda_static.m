@@ -1,6 +1,7 @@
 function test_stage2_archive_eda_static()
 % Lightweight structural checks for the stage-2 Archive + Surrogate + EDA path.
-script_path = fullfile(fileparts(mfilename('fullpath')), 'BPSO_unified.m');
+project_dir = fileparts(fileparts(mfilename('fullpath')));
+script_path = fullfile(project_dir, 'src', 'matlab', 'BPSO_unified.m');
 txt = fileread(script_path);
 
 must_contain(txt, 'METRIC_VERSION = 3');
