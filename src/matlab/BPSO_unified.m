@@ -1260,11 +1260,25 @@ function attach_parallel_files(pool, script_dir)
         fullfile(script_dir, 'append_path_once.m'), ...
         fullfile(script_dir, 'make_eval_result.m'), ...
         fullfile(script_dir, 'open_lumerical_mode.m'), ...
+        fullfile(script_dir, 'refresh_parallel_worker_code.m'), ...
         fullfile(script_dir, 'softmin_score.m'), ...
         fullfile(script_dir, 'set_slot.m'), ...
         fullfile(script_dir, 'train_out.m')};
     files = files(cellfun(@(f) exist(f, 'file') == 2, files));
-    addAttachedFiles(pool, files);
+
+    attached = string(pool.AttachedFiles);
+    if isempty(attached)
+        missing_files = files;
+    else
+        missing_files = files(~ismember(lower(string(files(:))), lower(attached(:))));
+    end
+    if ~isempty(missing_files)
+        addAttachedFiles(pool, missing_files);
+    end
+
+    updateAttachedFiles(pool);
+    futures = parfevalOnAll(pool, @refresh_parallel_worker_code, 0);
+    wait(futures);
 end
 
 function validate_parallel_lumerical_workers(lum_workers, expected_workers)

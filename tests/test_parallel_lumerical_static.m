@@ -37,6 +37,8 @@ must_contain(txt, 'PARALLEL_WORKERS = get_env_int(''PCM_LUM_WORKERS'', 4)');
 must_contain(txt, 'ensure_parallel_pool(PARALLEL_WORKERS)');
 must_contain(txt, 'parallel.pool.Constant');
 must_contain(txt, 'validate_parallel_lumerical_workers');
+must_contain(txt, 'updateAttachedFiles(pool)');
+must_contain(txt, 'parfevalOnAll(pool, @refresh_parallel_worker_code, 0)');
 must_contain(txt, 'run_parallel_eval_batch');
 must_contain(txt, 'make_lumerical_worker_session');
 must_contain(txt, 'worker_eval_particle');
@@ -58,6 +60,7 @@ verifyEqual(testCase, exist(fullfile(src_dir, 'softmin_score.m'), 'file'), 2);
 verifyEqual(testCase, exist(fullfile(src_dir, 'append_path_once.m'), 'file'), 2);
 verifyEqual(testCase, exist(fullfile(src_dir, 'make_eval_result.m'), 'file'), 2);
 verifyEqual(testCase, exist(fullfile(src_dir, 'open_lumerical_mode.m'), 'file'), 2);
+verifyEqual(testCase, exist(fullfile(src_dir, 'refresh_parallel_worker_code.m'), 'file'), 2);
 
 must_not_contain(worker_txt, 'function resetLastBits');
 must_not_contain(worker_txt, 'softmin_score_local');
@@ -68,6 +71,7 @@ must_not_contain(script_txt, 'function F = softmin_score(CR_each, tau, lambda_ba
 must_not_contain(script_txt, 'function h = open_lumerical_handle(sim_file)');
 must_contain(script_txt, 'make_eval_result(cached.n_right');
 must_contain(script_txt, 'open_lumerical_mode(SIM_FILE)');
+must_contain(script_txt, 'refresh_parallel_worker_code.m');
 end
 
 function testLumericalScriptsReuseSharedOpenAndPathHelpers(testCase)
