@@ -60,18 +60,47 @@ verifyEqual(testCase, exist(fullfile(src_dir, 'softmin_score.m'), 'file'), 2);
 verifyEqual(testCase, exist(fullfile(src_dir, 'append_path_once.m'), 'file'), 2);
 verifyEqual(testCase, exist(fullfile(src_dir, 'make_eval_result.m'), 'file'), 2);
 verifyEqual(testCase, exist(fullfile(src_dir, 'open_lumerical_mode.m'), 'file'), 2);
+verifyEqual(testCase, exist(fullfile(src_dir, 'make_lumerical_worker_sim_file.m'), 'file'), 2);
 verifyEqual(testCase, exist(fullfile(src_dir, 'refresh_parallel_worker_code.m'), 'file'), 2);
 
 must_not_contain(worker_txt, 'function resetLastBits');
 must_not_contain(worker_txt, 'softmin_score_local');
 must_not_contain(worker_txt, 'function result = make_eval_result');
+must_contain(worker_txt, 'make_lumerical_worker_sim_file(sim_file)');
+must_contain(worker_txt, 'open_lumerical_mode(obj.worker_sim_file)');
 must_contain(worker_txt, 'softmin_score(CR_each, tau, lambda_balance)');
 must_contain(worker_txt, 'append_path_once(getenv(''PATH''), lum_bin)');
 must_not_contain(script_txt, 'function F = softmin_score(CR_each, tau, lambda_balance)');
 must_not_contain(script_txt, 'function h = open_lumerical_handle(sim_file)');
 must_contain(script_txt, 'make_eval_result(cached.n_right');
 must_contain(script_txt, 'open_lumerical_mode(SIM_FILE)');
+must_contain(script_txt, 'make_lumerical_worker_sim_file.m');
 must_contain(script_txt, 'refresh_parallel_worker_code.m');
+end
+
+function testWorkerSimulationFileUsesPrivateCopy(testCase)
+src_dir = fullfile(testCase.TestData.project_dir, 'src', 'matlab');
+addpath(src_dir);
+
+source_dir = tempname;
+mkdir(source_dir);
+cleanup_source = onCleanup(@() cleanup_dir(source_dir));
+
+source_file = fullfile(source_dir, 'logic_mode.lms');
+write_text_file(source_file, {'worker-copy-test'});
+
+[worker_file, worker_dir] = make_lumerical_worker_sim_file(source_file);
+cleanup_worker = onCleanup(@() cleanup_dir(worker_dir));
+
+verifyNotEqual(testCase, worker_file, source_file);
+verifyEqual(testCase, exist(worker_file, 'file'), 2);
+verifyEqual(testCase, fileread(worker_file), fileread(source_file));
+verifyTrue(testCase, startsWith(worker_file, worker_dir));
+verifyNotEqual(testCase, fileparts(worker_file), source_dir);
+
+cleanup_worker.delete();
+verifyEqual(testCase, exist(worker_dir, 'dir'), 0);
+cleanup_source.delete();
 end
 
 function testLumericalScriptsReuseSharedOpenAndPathHelpers(testCase)
@@ -100,5 +129,19 @@ end
 function must_not_contain(txt, pattern)
 if contains(txt, pattern)
     error('Did not expect text to contain: %s', pattern);
+end
+end
+
+function write_text_file(file_path, lines)
+fid = fopen(file_path, 'w');
+assert(fid > 0, 'Failed to open %s for writing.', file_path);
+cleanup = onCleanup(@() fclose(fid));
+fprintf(fid, '%s\n', lines{:});
+cleanup.delete();
+end
+
+function cleanup_dir(dir_path)
+if exist(dir_path, 'dir')
+    rmdir(dir_path, 's');
 end
 end

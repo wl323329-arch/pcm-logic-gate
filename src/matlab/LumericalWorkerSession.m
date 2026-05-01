@@ -4,6 +4,8 @@ classdef LumericalWorkerSession < handle
         last_bits = []
         matA = ''
         matB = ''
+        worker_sim_file = ''
+        worker_sim_dir = ''
     end
 
     methods
@@ -16,7 +18,13 @@ classdef LumericalWorkerSession < handle
             obj.matB = matB;
             obj.last_bits = nan(d, 1);
 
-            obj.h = open_lumerical_mode(sim_file);
+            [obj.worker_sim_file, obj.worker_sim_dir] = make_lumerical_worker_sim_file(sim_file);
+            try
+                obj.h = open_lumerical_mode(obj.worker_sim_file);
+            catch ME
+                obj.cleanupWorkerSimulationFile();
+                rethrow(ME);
+            end
         end
 
         function delete(obj)
@@ -27,6 +35,7 @@ classdef LumericalWorkerSession < handle
                 end
                 obj.h = [];
             end
+            obj.cleanupWorkerSimulationFile();
         end
 
         function result = evalParticle(obj, L, train_data, train_target, size_train, size_target, tau, lambda_balance, full_eval)
@@ -108,6 +117,17 @@ classdef LumericalWorkerSession < handle
                 end
             end
             obj.last_bits = cur_bits;
+        end
+
+        function cleanupWorkerSimulationFile(obj)
+            if ~isempty(obj.worker_sim_dir) && exist(obj.worker_sim_dir, 'dir') == 7
+                try
+                    rmdir(obj.worker_sim_dir, 's');
+                catch
+                end
+            end
+            obj.worker_sim_file = '';
+            obj.worker_sim_dir = '';
         end
     end
 end
