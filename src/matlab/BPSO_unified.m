@@ -59,6 +59,7 @@ LOCAL_2BIT_TOP_BITS = 12;
 LOCAL_2BIT_EVAL = 8;
 SURROGATE_MIN_SAMPLES = 60;
 STALL_RESET_GEN = 4;
+PARALLEL_WORKERS = get_env_int('PCM_LUM_WORKERS', 4);
 
 % 材料名（增量 set_slot 用）
 matA = 'A_Sb2Se3';   % 非晶态
@@ -71,7 +72,6 @@ METRIC_VERSION = 3;  % v3 = full margins + soft archive score; best still uses t
 
 %% 共享优化基础设施
 eval_cache = containers.Map('KeyType','char','ValueType','any');
-last_bits  = nan(d, 1);
 stat_cache_hit   = 0;
 stat_cache_total = 0;
 stat_early_stop  = 0;
@@ -220,117 +220,107 @@ if ~resume_ok
     p_eda = initialize_eda_probability(seed_pool, d, p_min, p_max);
 end
 
-%% 打开 Lumerical（一次，两阶段共享）
+%% 启动并行 Lumerical worker
 path(path, LUM_API);
-[sim_file_path, sim_file_name, ~] = fileparts(SIM_FILE);
-
-h = appopen('mode');
-assert(~isempty(h), 'Failed to open MODE.');
-
-appputvar(h, 'sim_file_path', sim_file_path);
-appputvar(h, 'sim_file_name', sim_file_name);
-
-code = strcat('cd(sim_file_path);', 'load(sim_file_name);');
-appevalscript(h, code);
+h = [];
+lum_workers = [];
 
 %% ==================== 阶段1: 发现 ====================
 try
+pool = ensure_parallel_pool(PARALLEL_WORKERS);
+attach_parallel_files(pool, SCRIPT_DIR);
+lum_workers = parallel.pool.Constant( ...
+    @() make_lumerical_worker_session(SIM_FILE, LUM_BIN, LUM_API, matA, matB, d), ...
+    @close_lumerical_worker_session);
+validate_parallel_lumerical_workers(lum_workers, PARALLEL_WORKERS);
+fprintf('[INFO] Parallel Lumerical workers ready: %d MODE sessions.\n', PARALLEL_WORKERS);
 
 if phase == 1
     % 阶段1 是单遍随机扫描（ger=1），不做速度/位置迭代更新
     fprintf('========== 阶段1: 发现全对结构 (N=%d) ==========\n', N1);
 
     while num <= N1
+        batch_start = num;
+        batch_end = min(N1, batch_start + PARALLEL_WORKERS - 1);
+        batch_idx = batch_start:batch_end;
+        batch_results = run_parallel_eval_batch(lum_workers, x(batch_idx,:), eval_cache, ...
+            train_data, train_target, size_train, size_target, tau, lambda_balance, false);
 
-        t_particle = tic;
-        stat_cache_total = stat_cache_total + 1;
+        for bi = 1:numel(batch_idx)
+            idx = batch_idx(bi);
+            r = batch_results{bi};
+            stat_cache_total = stat_cache_total + 1;
 
-        L = x(num,:)';
+            n_right(idx,1)  = r.n_right;
+            CR_worst(idx,1) = r.CR_worst;
+            loss_mse(idx,1) = r.loss_mse;
 
-        [nr, crw, lmse, CR_each_now, F_soft_now, worst_idx_now, cache_hit, early_stopped, last_bits] = ...
-            eval_particle(h, L, eval_cache, last_bits, ...
-                          train_data, train_target, size_train, size_target, ...
-                          matA, matB, tau, lambda_balance, false);
-
-        n_right(num,1)  = nr;
-        CR_worst(num,1) = crw;
-        loss_mse(num,1) = lmse;
-
-        if cache_hit
-            stat_cache_hit = stat_cache_hit + 1;
-        end
-        if early_stopped
-            stat_early_stop = stat_early_stop + 1;
-        end
-        if ~cache_hit
-            [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
-             cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full] = ...
-                append_cache_arrays(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
-                                    cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full, ...
-                                    x(num,:), nr, crw, lmse, CR_each_now, F_soft_now, ...
-                                    worst_idx_now, nr == size_train(1));
-        end
-
-        % 适应度：n_right 优先，MSE 次之
-        fit_now = n_right(num,1) - loss_mse(num,1);
-
-        % 更新个体最优
-        if fit_now > fxm(num,1)
-            fxm(num,1) = fit_now;
-            xm(num,:) = x(num,:);
-        end
-
-        % 更新群体最优
-        if fit_now > fym
-            fym = fit_now;
-            ym = x(num,:);
-        end
-
-        % 全对结构 → 加入 seed_pool（去重）
-        if nr == size_train(1)
-            old_seed_count = size(seed_pool, 1);
-            [seed_pool, seed_pool_cr] = upsert_seed(seed_pool, seed_pool_cr, x(num,:), crw, MAX_IMPORTED_SEEDS);
-            if size(seed_pool, 1) > old_seed_count
-                fprintf('[发现] 第 %d 个全对结构! 粒子 %d, CR_worst = %.4f dB\n', ...
-                    size(seed_pool,1), num, crw);
+            if r.cache_hit
+                stat_cache_hit = stat_cache_hit + 1;
             end
+            if r.early_stopped
+                stat_early_stop = stat_early_stop + 1;
+            end
+            if ~r.cache_hit
+                eval_cache = store_eval_cache(eval_cache, x(idx,:), r);
+                [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
+                 cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full] = ...
+                    append_cache_arrays(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
+                                        cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full, ...
+                                        x(idx,:), r.n_right, r.CR_worst, r.loss_mse, r.CR_each, r.F_soft, ...
+                                        r.worst_idx, r.is_full);
+            end
+
+            fit_now = n_right(idx,1) - loss_mse(idx,1);
+
+            if fit_now > fxm(idx,1)
+                fxm(idx,1) = fit_now;
+                xm(idx,:) = x(idx,:);
+            end
+
+            if fit_now > fym
+                fym = fit_now;
+                ym = x(idx,:);
+            end
+
+            if r.n_right == size_train(1)
+                old_seed_count = size(seed_pool, 1);
+                [seed_pool, seed_pool_cr] = upsert_seed(seed_pool, seed_pool_cr, x(idx,:), r.CR_worst, MAX_IMPORTED_SEEDS);
+                if size(seed_pool, 1) > old_seed_count
+                    fprintf('[发现] 第 %d 个全对结构: 粒子 %d, CR_worst = %.4f dB\n', ...
+                        size(seed_pool,1), idx, r.CR_worst);
+                end
+            end
+
+            particle_time_sec(idx,1) = r.duration_sec;
+
+            done_idx = find(~isnan(particle_time_sec));
+            avg_dt   = mean(particle_time_sec(done_idx));
+            remain_num  = N1 - idx;
+            eta_sec     = remain_num * avg_dt / max(PARALLEL_WORKERS, 1);
+            finish_time = datetime('now') + seconds(eta_sec);
+            finish_time.Format = 'yyyy-MM-dd HH:mm:ss';
+            num_right4  = sum(n_right(1:idx) == size_train(1));
+            cache_rate  = stat_cache_hit / max(stat_cache_total, 1) * 100;
+            estop_rate  = stat_early_stop / max(stat_cache_total - stat_cache_hit, 1) * 100;
+
+            fprintf('[阶段1] 粒子 %d / %d | %.2f s | 均 %.2f s | 全对 %d | 种子 %d/%d | parallel=%d\n', ...
+                idx, N1, r.duration_sec, avg_dt, num_right4, size(seed_pool,1), N_SEED_TARGET, PARALLEL_WORKERS);
+            fprintf('  缓存 %.1f%% (%d/%d) | 早停 %.1f%% | 预计 %s\n', ...
+                cache_rate, stat_cache_hit, stat_cache_total, estop_rate, ...
+                char(finish_time));
+
+            record = build_record(x, v, xm, ym, fxm, fym, n_right, CR_worst, loss_mse); %#ok<NASGU>
+            record_time(idx,1) = string(datetime);
+            num = idx + 1;
+            save_checkpoint(SAVE_FILE);
         end
 
-        % 单粒子计时
-        dt_particle = toc(t_particle);
-        particle_time_sec(num,1) = dt_particle;
-
-        % 进度输出
-        done_idx = find(~isnan(particle_time_sec));
-        avg_dt   = mean(particle_time_sec(done_idx));
-        remain_num  = N1 - num;
-        eta_sec     = remain_num * avg_dt;
-        finish_time = datetime('now') + seconds(eta_sec);
-        finish_time.Format = 'yyyy-MM-dd HH:mm:ss';
-        num_right4  = sum(n_right(1:num) == size_train(1));
-        cache_rate  = stat_cache_hit / max(stat_cache_total, 1) * 100;
-        estop_rate  = stat_early_stop / max(stat_cache_total - stat_cache_hit, 1) * 100;
-
-        fprintf('[阶段1] 粒子 %d / %d | %.2f s | 均 %.2f s | 全对 %d | 种子 %d/%d\n', ...
-            num, N1, dt_particle, avg_dt, num_right4, size(seed_pool,1), N_SEED_TARGET);
-        fprintf('  缓存 %.1f%% (%d/%d) | 早停 %.1f%% | 预计 %s\n', ...
-            cache_rate, stat_cache_hit, stat_cache_total, estop_rate, ...
-            char(finish_time));
-
-        % 保存断点
-        record = build_record(x, v, xm, ym, fxm, fym, n_right, CR_worst, loss_mse); %#ok<NASGU>
-        record_time(num,1) = string(datetime);
-
-        save_checkpoint(SAVE_FILE);
-
-        % 检查是否够种子了
         if size(seed_pool, 1) >= N_SEED_TARGET
-            fprintf('\n[阶段切换] 已收集 %d 个全对结构，切换到优化阶段！\n\n', ...
+            fprintf('\n[阶段切换] 已收集 %d 个全对结构，切换到优化阶段。\n\n', ...
                 size(seed_pool, 1));
             break;
         end
-
-        num = num + 1;
     end
 
     if size(seed_pool, 1) < N_SEED_TARGET
@@ -352,7 +342,6 @@ if phase == 1
 
     iter = 1;
     num  = 1;
-    last_bits = nan(d, 1);   % 重置增量状态
 
     save_checkpoint(SAVE_FILE);
 end
@@ -396,78 +385,75 @@ if phase == 2
         end
 
         while num <= N2
+            batch_start = num;
+            batch_end = min(N2, batch_start + PARALLEL_WORKERS - 1);
+            batch_idx = batch_start:batch_end;
+            batch_results = run_parallel_eval_batch(lum_workers, x(batch_idx,:), eval_cache, ...
+                train_data, train_target, size_train, size_target, tau, lambda_balance, true);
 
-            t_particle = tic;
-            stat_cache_total = stat_cache_total + 1;
+            for bi = 1:numel(batch_idx)
+                idx = batch_idx(bi);
+                r = batch_results{bi};
+                stat_cache_total = stat_cache_total + 1;
 
-            L = x(num,:)';
+                n_right(idx,1)  = r.n_right;
+                CR_worst(idx,1) = r.CR_worst;
+                loss_mse(idx,1) = r.loss_mse;
 
-            [nr, crw, lmse, CR_each_now, F_soft_now, worst_idx_now, cache_hit, early_stopped, last_bits] = ...
-                eval_particle(h, L, eval_cache, last_bits, ...
-                              train_data, train_target, size_train, size_target, ...
-                              matA, matB, tau, lambda_balance, true);
-
-            n_right(num,1)  = nr;
-            CR_worst(num,1) = crw;
-            loss_mse(num,1) = lmse;
-
-            if cache_hit
-                stat_cache_hit = stat_cache_hit + 1;
-            end
-            if early_stopped
-                stat_early_stop = stat_early_stop + 1;
-            end
-            if ~cache_hit
-                [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
-                 cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full] = ...
-                    append_cache_arrays(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
-                                        cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full, ...
-                                        x(num,:), nr, crw, lmse, CR_each_now, F_soft_now, ...
-                                        worst_idx_now, nr == size_train(1));
-            end
-
-            % 逐粒子更新个体最优和全局最优（最终最优只用全对 CR_worst）
-            if nr == size_train(1) && crw > fxm(num)
-                fxm(num) = crw;
-                xm(num,:) = x(num,:);
-                if fxm(num) > fym
-                    fym = fxm(num);
-                    ym = xm(num,:);
-                    best_CR_each = CR_each_now(:)';
-                    best_worst_idx = worst_idx_now;
+                if r.cache_hit
+                    stat_cache_hit = stat_cache_hit + 1;
                 end
+                if r.early_stopped
+                    stat_early_stop = stat_early_stop + 1;
+                end
+                if ~r.cache_hit
+                    eval_cache = store_eval_cache(eval_cache, x(idx,:), r);
+                    [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
+                     cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full] = ...
+                        append_cache_arrays(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
+                                            cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full, ...
+                                            x(idx,:), r.n_right, r.CR_worst, r.loss_mse, r.CR_each, r.F_soft, ...
+                                            r.worst_idx, r.is_full);
+                end
+
+                if r.n_right == size_train(1) && r.CR_worst > fxm(idx)
+                    fxm(idx) = r.CR_worst;
+                    xm(idx,:) = x(idx,:);
+                    if fxm(idx) > fym
+                        fym = fxm(idx);
+                        ym = xm(idx,:);
+                        best_CR_each = r.CR_each(:)';
+                        best_worst_idx = r.worst_idx;
+                    end
+                end
+                if r.n_right == size_train(1)
+                    [seed_pool, seed_pool_cr] = upsert_seed(seed_pool, seed_pool_cr, x(idx,:), r.CR_worst, MAX_IMPORTED_SEEDS);
+                end
+
+                particle_time_sec(idx,1) = r.duration_sec;
+
+                done_idx = find(~isnan(particle_time_sec));
+                avg_dt   = mean(particle_time_sec(done_idx));
+                remain_num  = N2 - idx;
+                eta_sec     = remain_num * avg_dt / max(PARALLEL_WORKERS, 1);
+                finish_time = datetime('now') + seconds(eta_sec);
+                finish_time.Format = 'yyyy-MM-dd HH:mm:ss';
+                num_right4  = sum(n_right(1:idx) == size_train(1));
+                cache_rate  = stat_cache_hit / max(stat_cache_total, 1) * 100;
+
+                fprintf('[iter %d] 粒子 %d / %d | %.2f s | 均 %.2f s | 全对 %d | fym=%.4f dB | parallel=%d\n', ...
+                    iter, idx, N2, r.duration_sec, avg_dt, num_right4, fym, PARALLEL_WORKERS);
+                fprintf('  缓存 %.1f%% (%d/%d) | 预计 %s\n', ...
+                    cache_rate, stat_cache_hit, stat_cache_total, ...
+                    char(finish_time));
+
+                record = build_record(x, v, xm, ym, fxm, fym, n_right, CR_worst, loss_mse); %#ok<NASGU>
+                record_time(idx,1) = string(datetime);
+                num = idx + 1;
+                save_checkpoint(SAVE_FILE);
             end
-            if nr == size_train(1)
-                [seed_pool, seed_pool_cr] = upsert_seed(seed_pool, seed_pool_cr, x(num,:), crw, MAX_IMPORTED_SEEDS);
-            end
-
-            dt_particle = toc(t_particle);
-            particle_time_sec(num,1) = dt_particle;
-
-            % 进度输出
-            done_idx = find(~isnan(particle_time_sec));
-            avg_dt   = mean(particle_time_sec(done_idx));
-            remain_num  = N2 - num;
-            eta_sec     = remain_num * avg_dt;
-            finish_time = datetime('now') + seconds(eta_sec);
-            finish_time.Format = 'yyyy-MM-dd HH:mm:ss';
-            num_right4  = sum(n_right(1:num) == size_train(1));
-            cache_rate  = stat_cache_hit / max(stat_cache_total, 1) * 100;
-
-            fprintf('[iter %d] 粒子 %d / %d | %.2f s | 均 %.2f s | 全对 %d | fym=%.4f dB\n', ...
-                iter, num, N2, dt_particle, avg_dt, num_right4, fym);
-            fprintf('  缓存 %.1f%% (%d/%d) | 预计 %s\n', ...
-                cache_rate, stat_cache_hit, stat_cache_total, ...
-                char(finish_time));
-
-            % 保存断点
-            record = build_record(x, v, xm, ym, fxm, fym, n_right, CR_worst, loss_mse); %#ok<NASGU>
-            record_time(num,1) = string(datetime);
-
-            save_checkpoint(SAVE_FILE);
-
-            num = num + 1;
         end
+
 
         %% 一代结束
         fprintf('[Generation %d] fym = %.6f dB | 本代全对 %d / %d\n', ...
@@ -494,41 +480,40 @@ if phase == 2
                 size(selected_local, 1), stall_gen);
             local_improved = 0;
 
+            local_results = run_parallel_eval_batch(lum_workers, selected_local, eval_cache, ...
+                train_data, train_target, size_train, size_target, tau, lambda_balance, true);
             for li = 1:size(selected_local, 1)
                 neighbor = selected_local(li, :);
+                r = local_results{li};
 
                 stat_cache_total = stat_cache_total + 1;
-
-                [nb_nr, nb_crw, nb_lmse, nb_CR_each, nb_F_soft, nb_worst_idx, nb_cache_hit, nb_early_stopped, last_bits] = ...
-                    eval_particle(h, neighbor', eval_cache, last_bits, ...
-                                  train_data, train_target, size_train, size_target, ...
-                                  matA, matB, tau, lambda_balance, true);
-
-                if nb_cache_hit
+                if r.cache_hit
                     stat_cache_hit = stat_cache_hit + 1;
                 end
-                if nb_early_stopped
+                if r.early_stopped
                     stat_early_stop = stat_early_stop + 1;
                 end
-                if ~nb_cache_hit
+                if ~r.cache_hit
+                    eval_cache = store_eval_cache(eval_cache, neighbor, r);
                     [cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
                      cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full] = ...
                         append_cache_arrays(cache_bits, cache_n_right, cache_CR_worst, cache_loss_mse, ...
                                             cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full, ...
-                                            neighbor, nb_nr, nb_crw, nb_lmse, nb_CR_each, nb_F_soft, ...
-                                            nb_worst_idx, nb_nr == size_train(1));
+                                            neighbor, r.n_right, r.CR_worst, r.loss_mse, r.CR_each, r.F_soft, ...
+                                            r.worst_idx, r.is_full);
                 end
 
-                if nb_nr == size_train(1) && nb_crw > fym
-                    fym = nb_crw;
+                if r.n_right == size_train(1) && r.CR_worst > fym
+                    fym = r.CR_worst;
                     ym  = neighbor;
-                    best_CR_each = nb_CR_each(:)';
-                    best_worst_idx = nb_worst_idx;
+                    best_CR_each = r.CR_each(:)';
+                    best_worst_idx = r.worst_idx;
                     local_improved = local_improved + 1;
-                    [seed_pool, seed_pool_cr] = upsert_seed(seed_pool, seed_pool_cr, neighbor, nb_crw, MAX_IMPORTED_SEEDS);
+                    [seed_pool, seed_pool_cr] = upsert_seed(seed_pool, seed_pool_cr, neighbor, r.CR_worst, MAX_IMPORTED_SEEDS);
                     fprintf('  [targeted local] improved fym = %.6f dB, worst logic=%d\n', fym, best_worst_idx);
                 end
             end
+
             fprintf('[targeted local] done, improvements=%d, current fym=%.6f dB\n', local_improved, fym);
         end
 
@@ -544,7 +529,6 @@ if phase == 2
         CR_worst = zeros(N2, 1);
         loss_mse = zeros(N2, 1);
         particle_time_sec = nan(N2, 1);
-        last_bits = nan(d, 1);
 
         iter = iter + 1;
         num  = 1;
@@ -562,6 +546,7 @@ catch ME
         save_checkpoint(SAVE_FILE);
     catch
     end
+    cleanup_lumerical_constant(lum_workers);
     if ~isempty(h)
         try appclose(h); catch; end
     end
@@ -570,6 +555,8 @@ end
 
 %% ==================== 输出最优结果 ====================
 fprintf('\n===== 最优结构验证 =====\n');
+cleanup_lumerical_constant(lum_workers);
+h = open_lumerical_handle(SIM_FILE);
 L = ym';
 set_slot(h, L);
 
@@ -1242,6 +1229,163 @@ function y = scale01(x)
     end
 end
 
+function pool = ensure_parallel_pool(worker_count)
+    if license('test', 'Distrib_Computing_Toolbox') ~= 1
+        error('BPSO:ParallelToolboxUnavailable', ...
+            'Parallel Computing Toolbox is required for parallel Lumerical evaluation.');
+    end
+
+    pool = gcp('nocreate');
+    if ~isempty(pool) && pool.NumWorkers ~= worker_count
+        fprintf('[INFO] Recreating parallel pool: existing=%d, requested=%d.\n', ...
+            pool.NumWorkers, worker_count);
+        delete(pool);
+        pool = [];
+    end
+    if isempty(pool)
+        pool = parpool('local', worker_count);
+    end
+    if pool.NumWorkers ~= worker_count
+        error('BPSO:ParallelWorkerCountMismatch', ...
+            'Expected %d workers, got %d.', worker_count, pool.NumWorkers);
+    end
+end
+
+function attach_parallel_files(pool, script_dir)
+    files = { ...
+        fullfile(script_dir, 'LumericalWorkerSession.m'), ...
+        fullfile(script_dir, 'make_lumerical_worker_session.m'), ...
+        fullfile(script_dir, 'close_lumerical_worker_session.m'), ...
+        fullfile(script_dir, 'worker_eval_particle.m'), ...
+        fullfile(script_dir, 'set_slot.m'), ...
+        fullfile(script_dir, 'train_out.m')};
+    files = files(cellfun(@(f) exist(f, 'file') == 2, files));
+    addAttachedFiles(pool, files);
+end
+
+function validate_parallel_lumerical_workers(lum_workers, expected_workers)
+    spmd
+        worker_ok = false;
+        worker_msg = '';
+        try
+            session = lum_workers.Value;
+            worker_ok = ~isempty(session) && ~isempty(session.h);
+            if ~worker_ok
+                worker_msg = 'MODE handle is empty.';
+            end
+        catch ME
+            worker_msg = ME.message;
+        end
+    end
+
+    ok = false(1, numel(worker_ok));
+    msg = cell(1, numel(worker_ok));
+    for i = 1:numel(worker_ok)
+        ok(i) = worker_ok{i};
+        msg{i} = worker_msg{i};
+    end
+
+    if numel(ok) ~= expected_workers || ~all(ok)
+        detail = strjoin(msg(~ok), ' | ');
+        if isempty(detail)
+            detail = 'unknown worker startup failure';
+        end
+        error('BPSO:LumericalWorkerStartupFailed', ...
+            'Failed to start exactly %d Lumerical MODE worker sessions: %s', ...
+            expected_workers, detail);
+    end
+end
+
+function results = run_parallel_eval_batch(lum_workers, candidates, eval_cache, ...
+        train_data, train_target, size_train, size_target, tau, lambda_balance, full_eval)
+    n = size(candidates, 1);
+    results = cell(n, 1);
+    run_idx = zeros(0, 1);
+
+    for i = 1:n
+        key = char(candidates(i,:) + '0');
+        if eval_cache.isKey(key)
+            cached = eval_cache(key);
+            cached_is_full = isfield(cached, 'is_full') && cached.is_full;
+            if ~full_eval || cached_is_full
+                results{i} = result_from_cache(cached, size_train(1), tau, lambda_balance);
+                continue;
+            end
+        end
+        run_idx(end+1, 1) = i; %#ok<AGROW>
+    end
+
+    if ~isempty(run_idx)
+        run_results = cell(numel(run_idx), 1);
+        run_candidates = candidates(run_idx, :);
+        parfor ri = 1:numel(run_idx)
+            run_results{ri} = worker_eval_particle(lum_workers.Value, run_candidates(ri,:)', ... %#ok<PFBNS>
+                train_data, train_target, size_train, size_target, tau, lambda_balance, full_eval);
+        end
+
+        for ri = 1:numel(run_idx)
+            results{run_idx(ri)} = run_results{ri};
+        end
+    end
+end
+
+function result = result_from_cache(cached, n_logic, tau, lambda_balance)
+    result = struct();
+    result.n_right = cached.n_right;
+    result.CR_worst = cached.CR_worst;
+    result.loss_mse = cached.loss_mse;
+    if isfield(cached, 'CR_each') && numel(cached.CR_each) == n_logic
+        result.CR_each = cached.CR_each(:);
+    else
+        result.CR_each = nan(n_logic, 1);
+    end
+    if isfield(cached, 'F_soft')
+        result.F_soft = cached.F_soft;
+    else
+        result.F_soft = softmin_score(result.CR_each, tau, lambda_balance);
+    end
+    if isfield(cached, 'worst_idx')
+        result.worst_idx = cached.worst_idx;
+    else
+        [~, result.worst_idx] = min(result.CR_each);
+    end
+    result.is_full = isfield(cached, 'is_full') && cached.is_full;
+    result.cache_hit = true;
+    result.early_stopped = false;
+    result.duration_sec = 0;
+end
+
+function eval_cache = store_eval_cache(eval_cache, bits, result)
+    ce = struct();
+    ce.p = [];
+    ce.n_right = result.n_right;
+    ce.CR_worst = result.CR_worst;
+    ce.loss_mse = result.loss_mse;
+    ce.CR_each = result.CR_each(:);
+    ce.F_soft = result.F_soft;
+    ce.worst_idx = result.worst_idx;
+    ce.is_full = result.is_full;
+    eval_cache(char(double(bits(:)') + '0')) = ce;
+end
+
+function h = open_lumerical_handle(sim_file)
+    [sim_file_path, sim_file_name, ~] = fileparts(sim_file);
+    h = appopen('mode');
+    assert(~isempty(h), 'Failed to open MODE.');
+    appputvar(h, 'sim_file_path', sim_file_path);
+    appputvar(h, 'sim_file_name', sim_file_name);
+    appevalscript(h, strcat('cd(sim_file_path);', 'load(sim_file_name);'));
+end
+
+function cleanup_lumerical_constant(lum_workers)
+    if ~isempty(lum_workers)
+        try
+            delete(lum_workers);
+        catch
+        end
+    end
+end
+
 function selected_local = targeted_local_candidates(ym, surrogate, d, K1, K2_TOP_BITS, K2, stall_gen)
     if nargin < 7 || isempty(stall_gen)
         stall_gen = 0;
@@ -1291,149 +1435,6 @@ function selected_local = targeted_local_candidates(ym, surrogate, d, K1, K2_TOP
     end
 
     selected_local = unique([eval_1bit; eval_2bit; eval_3bit], 'rows', 'stable');
-end
-
-function last_bits = do_incremental_set(h, L, last_bits, matA, matB)
-% 增量 set_slot：只更新变化的孔洞材料，减少 Lumerical 脚本执行量
-    cur_bits = L;
-    if any(isnan(last_bits))
-        set_slot(h, L);
-    else
-        changed_idx = find(cur_bits ~= last_bits);
-        if ~isempty(changed_idx)
-            commands = cell(1, numel(changed_idx) + 1);
-            commands{1} = 'switchtolayout;';
-            for ci = 1:length(changed_idx)
-                idx_i = changed_idx(ci);
-                name = ['gra', num2str(idx_i)];
-                if cur_bits(idx_i) == 0
-                    mat_name = matA;
-                else
-                    mat_name = matB;
-                end
-                commands{ci + 1} = ['select("', name, '");', ...
-                    'set("material","', mat_name, '");'];
-            end
-            inc_code = [commands{:}];
-            appevalscript(h, inc_code);
-        end
-    end
-    last_bits = cur_bits;
-end
-
-function [nr, crw, lmse, CR_each, F_soft, worst_idx, cache_hit, early_stopped, last_bits] = ...
-        eval_particle(h, L, eval_cache, last_bits, ...
-                      train_data, train_target, size_train, size_target, ...
-                      matA, matB, tau, lambda_balance, full_eval)
-% Evaluate one particle. Stage 2 should pass full_eval=true so every logic
-% state contributes a continuous margin to the archive/surrogate.
-    if nargin < 11
-        tau = 2.0;
-    end
-    if nargin < 12
-        lambda_balance = 0.05;
-    end
-    if nargin < 13
-        full_eval = false;
-    end
-    cache_hit = false;
-    early_stopped = false;
-    cache_key = char(L' + '0');
-
-    if eval_cache.isKey(cache_key)
-        cached = eval_cache(cache_key);
-        cached_is_full = isfield(cached, 'is_full') && cached.is_full;
-        if ~full_eval || cached_is_full
-            nr   = cached.n_right;
-            crw  = cached.CR_worst;
-            lmse = cached.loss_mse;
-            if isfield(cached, 'CR_each') && numel(cached.CR_each) == size_train(1)
-                CR_each = cached.CR_each(:);
-            else
-                CR_each = nan(size_train(1), 1);
-            end
-            if isfield(cached, 'F_soft')
-                F_soft = cached.F_soft;
-            else
-                F_soft = softmin_score(CR_each, tau, lambda_balance);
-            end
-            if isfield(cached, 'worst_idx')
-                worst_idx = cached.worst_idx;
-            else
-                [~, worst_idx] = min(CR_each);
-            end
-            cache_hit = true;
-            return;
-        end
-    end
-
-    % 增量 set_slot
-    last_bits = do_incremental_set(h, L, last_bits, matA, matB);
-
-    p = zeros(size_target);
-    eps_val = 1e-30;
-    CR_each = nan(size_train(1), 1);
-    correct_vec = false(size_train(1), 1);
-
-    % 逐逻辑态仿真 + 早停
-    for tt = 1:size_train(1)
-        phs = train_data(tt,:) * 180/pi;
-        p(tt,:) = train_out(h, phs);
-
-        if train_target(tt,1) > train_target(tt,2)
-            P_right = abs(p(tt,1));
-            P_wrong = abs(p(tt,2));
-        else
-            P_right = abs(p(tt,2));
-            P_wrong = abs(p(tt,1));
-        end
-        CR_each(tt) = 10 * log10((P_right + eps_val) / (P_wrong + eps_val));
-        correct_vec(tt) = (p(tt,1) > p(tt,2)) == (train_target(tt,1) > train_target(tt,2));
-
-        correct_so_far = sum(double(correct_vec(1:tt)));
-        if ~full_eval && tt - correct_so_far > 0
-            early_stopped = true;
-            nr   = correct_so_far;
-            crw  = min(CR_each(1:tt));
-            [~, worst_idx] = min(CR_each(1:tt));
-            F_soft = -inf;
-            p(tt+1:end,:) = NaN;  % 未仿真行标记为 NaN，避免误用
-            p_clean = p;
-            p_clean(isnan(p_clean)) = 0;
-            p_norm = p_clean / (max(p_clean,[],"all") + eps_val);
-            lmse = sumsqr(p_norm - train_target);
-            % 写入缓存
-            ce.p = p;
-            ce.n_right = nr;
-            ce.CR_worst = crw;
-            ce.loss_mse = lmse;
-            ce.CR_each = CR_each;
-            ce.F_soft = F_soft;
-            ce.worst_idx = worst_idx;
-            ce.is_full = false;
-            eval_cache(cache_key) = ce; %#ok<NASGU>
-            return;
-        end
-    end
-
-    nr = sum(double(correct_vec));
-    crw = min(CR_each);
-    [~, worst_idx] = min(CR_each);
-    F_soft = softmin_score(CR_each, tau, lambda_balance);
-
-    p_norm = p / (max(p,[],"all") + eps_val);
-    lmse = sumsqr(p_norm - train_target);
-
-    % 写入缓存
-    ce.p = p;
-    ce.n_right = nr;
-    ce.CR_worst = crw;
-    ce.loss_mse = lmse;
-    ce.CR_each = CR_each;
-    ce.F_soft = F_soft;
-    ce.worst_idx = worst_idx;
-    ce.is_full = true;
-    eval_cache(cache_key) = ce; %#ok<NASGU>
 end
 
 function F = softmin_score(CR_each, tau, lambda_balance)

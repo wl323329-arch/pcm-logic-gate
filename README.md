@@ -15,11 +15,24 @@ MATLAB and Lumerical MODE scripts for binary-material PCM logic-gate optimizatio
 
 ## Main Scripts
 
-- `src/matlab/BPSO_unified.m` - two-stage BPSO/memetic optimization loop.
+- `src/matlab/BPSO_unified.m` - two-stage BPSO/memetic optimization loop with parallel Lumerical evaluations.
 - `src/matlab/verify_best.m` - verifies the current best saved structure.
 - `src/matlab/load_best.m` - loads the current best structure into Lumerical MODE.
 - `src/matlab/plot_field.m` - plots field data from the current best structure.
 - `src/matlab/set_slot.m`, `src/matlab/train_out.m`, and `src/matlab/checkpoint_var_names.m` - Lumerical and checkpoint helper functions.
+
+## Runtime Configuration
+
+`src/matlab/BPSO_unified.m` uses MATLAB Parallel Computing Toolbox to run multiple independent Lumerical MODE sessions. The default is 4 concurrent simulations.
+
+Override the worker count before running the optimizer:
+
+```matlab
+setenv('PCM_LUM_WORKERS', '8');   % or 16 if licenses and hardware allow it
+run('src/matlab/BPSO_unified.m');
+```
+
+The optimizer requires the requested number of MODE sessions to start successfully. If any worker cannot open or load Lumerical MODE, the run stops instead of silently using fewer workers.
 
 ## Lightweight Checks
 
@@ -30,7 +43,7 @@ results = runtests('tests');
 assert(all([results.Passed]));
 ```
 
-These tests cover the stage-2 static structure and checkpoint save-field consistency. Full optimization and verification scripts still require the local Lumerical MODE install and simulation files.
+These tests cover the stage-2 static structure, parallel configuration, and checkpoint save-field consistency. Full optimization and verification scripts still require the local Lumerical MODE install and simulation files.
 
 ## Local Data
 
