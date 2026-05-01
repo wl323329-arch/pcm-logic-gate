@@ -10,7 +10,8 @@ This repository contains MATLAB and Lumerical MODE scripts for PCM logic-gate op
 - MATLAB Parallel Computing Toolbox is used by `src/matlab/BPSO_unified.m` for parallel Lumerical evaluation.
 - Lumerical MODE paths are currently hard-coded in the active scripts as `D:\Program Files\Lumerical\v231\bin` and `D:\Program Files\Lumerical\v231\api\matlab`.
 - `src/matlab/BPSO_unified.m` defaults to 4 concurrent MODE sessions. Override with `PCM_LUM_WORKERS` before running the optimizer, for example `setenv('PCM_LUM_WORKERS','8')`.
-- Parallel startup is fail-fast: if the configured number of MODE sessions cannot open and load `structure/logic_mode.lms`, the optimizer stops instead of silently reducing concurrency.
+- Parallel startup is fail-fast: if the configured number of MODE sessions cannot open and load a private temporary copy of `structure/logic_mode.lms`, the optimizer stops instead of silently reducing concurrency.
+- Each `LumericalWorkerSession` copies `structure/logic_mode.lms` to its own temporary directory through `src/matlab/make_lumerical_worker_sim_file.m`, then opens that private copy. This avoids MODE "project file has been modified on disk" dialogs when workers modify layout state in parallel.
 - Large `.mat`, `.lms`, `.mdf`, and `.log` files are intentionally ignored unless already tracked.
 
 ## Checks

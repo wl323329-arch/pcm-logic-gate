@@ -32,7 +32,7 @@ setenv('PCM_LUM_WORKERS', '8');   % or 16 if licenses and hardware allow it
 run('src/matlab/BPSO_unified.m');
 ```
 
-The optimizer requires the requested number of MODE sessions to start successfully. If any worker cannot open or load Lumerical MODE, the run stops instead of silently using fewer workers.
+The optimizer requires the requested number of MODE sessions to start successfully. Each worker copies `structure/logic_mode.lms` to a private temporary directory and opens that copy, so concurrent layout edits do not trigger MODE's "project file has been modified on disk" prompt. If any worker cannot open or load its private project copy, the run stops instead of silently using fewer workers.
 
 ## Lightweight Checks
 
@@ -43,7 +43,7 @@ results = runtests('tests');
 assert(all([results.Passed]));
 ```
 
-These tests cover the stage-2 static structure, parallel configuration, and checkpoint save-field consistency. Full optimization and verification scripts still require the local Lumerical MODE install and simulation files.
+These tests cover the stage-2 static structure, parallel configuration, private worker simulation-file copies, and checkpoint save-field consistency. Full optimization and verification scripts still require the local Lumerical MODE install and simulation files.
 
 ## Local Data
 
