@@ -1,4 +1,8 @@
-function test_stage2_archive_eda_static()
+function tests = test_stage2_archive_eda_static()
+tests = functiontests(localfunctions);
+end
+
+function testStage2ArchiveEdaStatic(~)
 % Lightweight structural checks for the stage-2 Archive + Surrogate + EDA path.
 project_dir = fileparts(fileparts(mfilename('fullpath')));
 script_path = fullfile(project_dir, 'src', 'matlab', 'BPSO_unified.m');
@@ -28,6 +32,7 @@ must_contain(txt, 'eval_3bit');
 must_contain(txt, 'softmin_score');
 must_contain(txt, 'full_eval');
 must_contain(txt, 'TreeBagger');
+must_contain(txt, 'checkpoint_var_names()');
 
 if contains(txt, 'x = build_next_population(ym, xm, fxm')
     error('Stage 2 still calls the old BPSO/memetic build_next_population path.');

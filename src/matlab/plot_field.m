@@ -1,4 +1,4 @@
-clear all; close all; clc;
+clearvars; close all; clc;
 
 %% 路径设置
 LUM_BIN  = 'D:\Program Files\Lumerical\v231\bin';
@@ -27,7 +27,7 @@ fprintf('最优结构: %s\n', char(ym + '0'));
 
 %% 选择要画的逻辑态（修改此处切换输入组合）
 % train_data 每行对应一个逻辑态，选第几行就画哪个态
-logic_idx = 2;   % 例如第3行可能是 '1','1' 输入
+logic_idx = 2;   % 例如第2行可能是 '0','1' 输入
 phs = train_data(logic_idx, :) * 180/pi;
 fprintf('绘制逻辑态 %d, 相位 = [%.1f, %.1f, %.1f] deg\n', logic_idx, phs);
 
@@ -88,13 +88,11 @@ for si = 1:3
     end
 end
 
-% 输出标签：根据 train_target 判断哪个输出是 '1'
+% 输出标签：始终标注"正确输出端"为 '1'（端口位置由下文 train_target 判断）
 load(fullfile(DATA_DIR, 'train_target.mat'));
-if train_target(logic_idx, 1) > train_target(logic_idx, 2)
-    out_label = '''1''';   % output1 更强
-else
-    out_label = '''1''';   % output2 更强
-end
+assert(logic_idx >= 1 && logic_idx <= size(train_target, 1), ...
+    'logic_idx must be between 1 and %d.', size(train_target, 1));
+out_label = '''1''';
 
 %% 找输入/输出波导的 y 位置（多列平均 + 自适应阈值）
 y_um = yu * 1e6;
@@ -120,7 +118,7 @@ figure('Position', [100 100 800 400]);
 imagesc(x_um, y_um, E_intensity');
 set(gca, 'YDir', 'normal');
 colormap('jet');
-cb = colorbar;
+colorbar;
 clim([0 1]);
 set(gca, 'XTick', [], 'YTick', []);   % 去掉坐标刻度
 set(gca, 'XColor', 'none', 'YColor', 'none');  % 去掉坐标轴线

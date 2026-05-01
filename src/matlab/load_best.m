@@ -1,4 +1,4 @@
-clear all; close all; clc;
+clearvars; close all; clc;
 
 %% 路径设置
 LUM_BIN  = 'D:\Program Files\Lumerical\v231\bin';

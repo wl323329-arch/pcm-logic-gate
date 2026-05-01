@@ -19,7 +19,18 @@ MATLAB and Lumerical MODE scripts for binary-material PCM logic-gate optimizatio
 - `src/matlab/verify_best.m` - verifies the current best saved structure.
 - `src/matlab/load_best.m` - loads the current best structure into Lumerical MODE.
 - `src/matlab/plot_field.m` - plots field data from the current best structure.
-- `src/matlab/set_slot.m` and `src/matlab/train_out.m` - Lumerical helper functions.
+- `src/matlab/set_slot.m`, `src/matlab/train_out.m`, and `src/matlab/checkpoint_var_names.m` - Lumerical and checkpoint helper functions.
+
+## Lightweight Checks
+
+Run the non-Lumerical MATLAB checks with:
+
+```matlab
+results = runtests('tests');
+assert(all([results.Passed]));
+```
+
+These tests cover the stage-2 static structure and checkpoint save-field consistency. Full optimization and verification scripts still require the local Lumerical MODE install and simulation files.
 
 ## Local Data
 

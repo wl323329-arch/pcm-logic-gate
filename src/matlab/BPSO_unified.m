@@ -1,4 +1,4 @@
-clear all; close all; clc;
+clearvars; close all; clc;
 
 %% 路径设置
 LUM_BIN  = 'D:\Program Files\Lumerical\v231\bin';
@@ -45,7 +45,6 @@ CONTINUE_FROM_EXISTING_RESULTS = true;  % 自动导入 record_unified*.mat 作�
 START_STAGE2_WITH_IMPORTED_SEEDS = true;
 STAGE2_EXTRA_GENERATIONS_ON_RESUME = 20;
 MAX_IMPORTED_SEEDS = 200;
-DUPLICATE_RETRY_LIMIT = 80;
 N_INIT_REEVAL = 80;
 N_CAND = 5000;
 K_TRUE = N2;
@@ -212,8 +211,7 @@ if ~resume_ok
         loss_mse = zeros(N1, 1);
         particle_time_sec = nan(N1, 1);
 
-        record = [x, v, xm, repmat(ym,N1,1), fxm, repmat(fym,N1,1), ...
-                  n_right, CR_worst, loss_mse];
+        record = build_record(x, v, xm, ym, fxm, fym, n_right, CR_worst, loss_mse);
         record_time = repmat(string(datetime), N1, 1);
     end
 
@@ -226,7 +224,6 @@ end
 path(path, LUM_API);
 [sim_file_path, sim_file_name, ~] = fileparts(SIM_FILE);
 
-h = [];
 h = appopen('mode');
 assert(~isempty(h), 'Failed to open MODE.');
 
@@ -291,16 +288,9 @@ if phase == 1
 
         % 全对结构 → 加入 seed_pool（去重）
         if nr == size_train(1)
-            is_dup = false;
-            for si = 1:size(seed_pool,1)
-                if isequal(seed_pool(si,:), x(num,:))
-                    is_dup = true;
-                    break;
-                end
-            end
-            if ~is_dup
-                seed_pool = [seed_pool; x(num,:)];
-                seed_pool_cr = [seed_pool_cr; crw];
+            old_seed_count = size(seed_pool, 1);
+            [seed_pool, seed_pool_cr] = upsert_seed(seed_pool, seed_pool_cr, x(num,:), crw, MAX_IMPORTED_SEEDS);
+            if size(seed_pool, 1) > old_seed_count
                 fprintf('[发现] 第 %d 个全对结构! 粒子 %d, CR_worst = %.4f dB\n', ...
                     size(seed_pool,1), num, crw);
             end
@@ -316,6 +306,7 @@ if phase == 1
         remain_num  = N1 - num;
         eta_sec     = remain_num * avg_dt;
         finish_time = datetime('now') + seconds(eta_sec);
+        finish_time.Format = 'yyyy-MM-dd HH:mm:ss';
         num_right4  = sum(n_right(1:num) == size_train(1));
         cache_rate  = stat_cache_hit / max(stat_cache_total, 1) * 100;
         estop_rate  = stat_early_stop / max(stat_cache_total - stat_cache_hit, 1) * 100;
@@ -324,25 +315,13 @@ if phase == 1
             num, N1, dt_particle, avg_dt, num_right4, size(seed_pool,1), N_SEED_TARGET);
         fprintf('  缓存 %.1f%% (%d/%d) | 早停 %.1f%% | 预计 %s\n', ...
             cache_rate, stat_cache_hit, stat_cache_total, estop_rate, ...
-            datestr(finish_time, 'yyyy-mm-dd HH:MM:SS'));
+            char(finish_time));
 
         % 保存断点
-        record = [x, v, xm, repmat(ym,N1,1), fxm, repmat(fym,N1,1), ...
-                  n_right, CR_worst, loss_mse];
+        record = build_record(x, v, xm, ym, fxm, fym, n_right, CR_worst, loss_mse); %#ok<NASGU>
         record_time(num,1) = string(datetime);
 
-        metric_version = METRIC_VERSION;
-        save(SAVE_FILE, ...
-            'metric_version', 'phase', 'seed_pool', 'seed_pool_cr', ...
-            'record', 'record_time', ...
-            'x', 'v', 'xm', 'ym', 'fxm', 'fym', ...
-            'n_right', 'CR_worst', 'loss_mse', ...
-            'particle_time_sec', 'iter', 'num', ...
-            'cache_bits', 'cache_n_right', 'cache_CR_worst', 'cache_loss_mse', ...
-            'cache_CR_each', 'cache_F_soft', 'cache_worst_idx', 'cache_is_full', ...
-            'stage2_target_iter', 'stall_gen', 'fym_prev', ...
-            'p_eda', 'best_CR_each', 'best_worst_idx', 'init_reeval_queue', ...
-            '-v7.3');
+        save_checkpoint(SAVE_FILE);
 
         % 检查是否够种子了
         if size(seed_pool, 1) >= N_SEED_TARGET
@@ -375,18 +354,7 @@ if phase == 1
     num  = 1;
     last_bits = nan(d, 1);   % 重置增量状态
 
-    metric_version = METRIC_VERSION;
-    save(SAVE_FILE, ...
-        'metric_version', 'phase', 'seed_pool', 'seed_pool_cr', ...
-        'record', 'record_time', ...
-        'x', 'v', 'xm', 'ym', 'fxm', 'fym', ...
-        'n_right', 'CR_worst', 'loss_mse', ...
-        'particle_time_sec', 'iter', 'num', ...
-        'cache_bits', 'cache_n_right', 'cache_CR_worst', 'cache_loss_mse', ...
-        'cache_CR_each', 'cache_F_soft', 'cache_worst_idx', 'cache_is_full', ...
-        'stage2_target_iter', 'stall_gen', 'fym_prev', ...
-        'p_eda', 'best_CR_each', 'best_worst_idx', 'init_reeval_queue', ...
-        '-v7.3');
+    save_checkpoint(SAVE_FILE);
 end
 
 %% ==================== 阶段2: 优化 ====================
@@ -482,6 +450,7 @@ if phase == 2
             remain_num  = N2 - num;
             eta_sec     = remain_num * avg_dt;
             finish_time = datetime('now') + seconds(eta_sec);
+            finish_time.Format = 'yyyy-MM-dd HH:mm:ss';
             num_right4  = sum(n_right(1:num) == size_train(1));
             cache_rate  = stat_cache_hit / max(stat_cache_total, 1) * 100;
 
@@ -489,25 +458,13 @@ if phase == 2
                 iter, num, N2, dt_particle, avg_dt, num_right4, fym);
             fprintf('  缓存 %.1f%% (%d/%d) | 预计 %s\n', ...
                 cache_rate, stat_cache_hit, stat_cache_total, ...
-                datestr(finish_time, 'yyyy-mm-dd HH:MM:SS'));
+                char(finish_time));
 
             % 保存断点
-            record = [x, v, xm, repmat(ym,N2,1), fxm, repmat(fym,N2,1), ...
-                      n_right, CR_worst, loss_mse];
+            record = build_record(x, v, xm, ym, fxm, fym, n_right, CR_worst, loss_mse); %#ok<NASGU>
             record_time(num,1) = string(datetime);
 
-            metric_version = METRIC_VERSION;
-            save(SAVE_FILE, ...
-                'metric_version', 'phase', 'seed_pool', 'seed_pool_cr', ...
-                'record', 'record_time', ...
-                'x', 'v', 'xm', 'ym', 'fxm', 'fym', ...
-                'n_right', 'CR_worst', 'loss_mse', ...
-                'particle_time_sec', 'iter', 'num', ...
-                'cache_bits', 'cache_n_right', 'cache_CR_worst', 'cache_loss_mse', ...
-                'cache_CR_each', 'cache_F_soft', 'cache_worst_idx', 'cache_is_full', ...
-                'stage2_target_iter', 'stall_gen', 'fym_prev', ...
-                'p_eda', 'best_CR_each', 'best_worst_idx', 'init_reeval_queue', ...
-                '-v7.3');
+            save_checkpoint(SAVE_FILE);
 
             num = num + 1;
         end
@@ -593,45 +550,16 @@ if phase == 2
         num  = 1;
 
         % 代结束保存
-        record = [x, v, xm, repmat(ym,N2,1), fxm, repmat(fym,N2,1), ...
-                  n_right, CR_worst, loss_mse];
+        record = build_record(x, v, xm, ym, fxm, fym, n_right, CR_worst, loss_mse);
 
-        metric_version = METRIC_VERSION;
-        save(SAVE_FILE, ...
-            'metric_version', 'phase', 'seed_pool', 'seed_pool_cr', ...
-            'record', 'record_time', ...
-            'x', 'v', 'xm', 'ym', 'fxm', 'fym', ...
-            'n_right', 'CR_worst', 'loss_mse', ...
-            'particle_time_sec', 'iter', 'num', ...
-            'cache_bits', 'cache_n_right', 'cache_CR_worst', 'cache_loss_mse', ...
-            'cache_CR_each', 'cache_F_soft', 'cache_worst_idx', 'cache_is_full', ...
-            'stage2_target_iter', 'stall_gen', 'fym_prev', ...
-            'p_eda', 'best_CR_each', 'best_worst_idx', 'init_reeval_queue', ...
-            '-v7.3');
+        save_checkpoint(SAVE_FILE);
     end
 end
 
 catch ME
     try
-        if phase == 1
-            N_cur = N1;
-        else
-            N_cur = N2;
-        end
-        record = [x, v, xm, repmat(ym,N_cur,1), fxm, repmat(fym,N_cur,1), ...
-                  n_right, CR_worst, loss_mse];
-        metric_version = METRIC_VERSION;
-        save(SAVE_FILE, ...
-            'metric_version', 'phase', 'seed_pool', 'seed_pool_cr', ...
-            'record', 'record_time', ...
-            'x', 'v', 'xm', 'ym', 'fxm', 'fym', ...
-            'n_right', 'CR_worst', 'loss_mse', ...
-            'particle_time_sec', 'iter', 'num', ...
-            'cache_bits', 'cache_n_right', 'cache_CR_worst', 'cache_loss_mse', ...
-            'cache_CR_each', 'cache_F_soft', 'cache_worst_idx', 'cache_is_full', ...
-            'stage2_target_iter', 'stall_gen', 'fym_prev', ...
-            'p_eda', 'best_CR_each', 'best_worst_idx', 'init_reeval_queue', ...
-            '-v7.3');
+        record = build_record(x, v, xm, ym, fxm, fym, n_right, CR_worst, loss_mse); %#ok<NASGU>
+        save_checkpoint(SAVE_FILE);
     catch
     end
     if ~isempty(h)
@@ -697,7 +625,7 @@ function tag = infer_logic_gate_name(train_data_raw, train_target)
         return;
     end
 
-    if size(train_data_raw, 2) >= 3 && numel(unique(train_data_raw(:, 2))) == 1
+    if size(train_data_raw, 2) >= 3 && isscalar(unique(train_data_raw(:, 2)))
         a = train_data_raw(:, 1) > 0.5;
         b = train_data_raw(:, 3) > 0.5;
     elseif size(train_data_raw, 2) >= 2
@@ -842,7 +770,7 @@ function cand = collect_initial_reeval_candidates(patterns, d, max_candidates)
             local_cand = [local_cand; rb(1:min(size(rb, 1), max_candidates), :)]; %#ok<AGROW>
         end
         local_cand = local_cand(all(local_cand == 0 | local_cand == 1, 2), :);
-        cand = unique([cand; local_cand], 'rows', 'stable'); %#ok<AGROW>
+        cand = unique([cand; local_cand], 'rows', 'stable');
         if size(cand, 1) >= max_candidates
             cand = cand(1:max_candidates, :);
             break;
@@ -902,8 +830,7 @@ function [x, v, xm, fxm, fym, ym, n_right, CR_worst, loss_mse, particle_time_sec
     CR_worst = zeros(N, 1);
     loss_mse = zeros(N, 1);
     particle_time_sec = nan(N, 1);
-    record = [x, v, xm, repmat(ym,N,1), fxm, repmat(fym,N,1), ...
-              n_right, CR_worst, loss_mse];
+    record = build_record(x, v, xm, ym, fxm, fym, n_right, CR_worst, loss_mse);
     record_time = repmat(string(datetime), N, 1);
 end
 
@@ -940,6 +867,12 @@ function [cache_CR_each, cache_F_soft, cache_worst_idx, cache_is_full] = ...
         end
         cache_is_full(i) = cache_n_right(i) == n_logic && all(isfinite(cache_CR_each(i,:)));
     end
+end
+
+function record = build_record(x, v, xm, ym, fxm, fym, n_right, CR_worst, loss_mse)
+    n = size(x, 1);
+    record = [x, v, xm, repmat(ym, n, 1), fxm, repmat(fym, n, 1), ...
+              n_right, CR_worst, loss_mse];
 end
 
 function v = resize_col(v, n, fill_value)
@@ -1016,56 +949,6 @@ function [seed_pool, seed_pool_cr] = upsert_seed(seed_pool, seed_pool_cr, bits, 
     if size(seed_pool, 1) > max_seeds
         seed_pool = seed_pool(1:max_seeds, :);
         seed_pool_cr = seed_pool_cr(1:max_seeds);
-    end
-end
-
-function x_next = build_next_population(ym, xm, fxm, N, d, iter, target_iter, stall_gen, eval_cache, retry_limit)
-    x_next = zeros(N, d);
-    x_next(1,:) = ym;
-
-    valid = find(isfinite(fxm));
-    if isempty(valid)
-        elites = ym;
-    else
-        [~, order] = sort(fxm(valid), 'descend');
-        elite_idx = valid(order(1:min(length(order), max(3, ceil(0.25*N)))));
-        elites = unique([ym; xm(elite_idx,:)], 'rows', 'stable');
-    end
-
-    progress = min(1, max(0, (iter - 1) / max(target_iter - 1, 1)));
-    base_flip = (5/d) * (1 - progress) + (1/d) * progress;
-    p_flip = min(10/d, base_flip + min(stall_gen, 6) / d);
-
-    for i = 2:N
-        candidate = [];
-        for attempt = 1:retry_limit
-            parent = elites(randi(size(elites, 1)), :);
-            if size(elites, 1) > 1 && rand < 0.35
-                parent2 = elites(randi(size(elites, 1)), :);
-                mask_cross = rand(1, d) < 0.5;
-                parent(mask_cross) = parent2(mask_cross);
-            end
-
-            flip_mask = rand(1, d) < p_flip;
-            if ~any(flip_mask)
-                flip_mask(randi(d)) = true;
-            end
-            trial = double(xor(parent, flip_mask));
-
-            if ~eval_cache.isKey(char(trial + '0')) && ~row_exists(x_next(1:i-1,:), trial)
-                candidate = trial;
-                break;
-            end
-        end
-
-        if isempty(candidate)
-            parent = elites(randi(size(elites, 1)), :);
-            flip_count = randi([1, min(d, 2 + stall_gen + ceil(4*(1-progress)))]);
-            flip_idx = randperm(d, flip_count);
-            parent(flip_idx) = 1 - parent(flip_idx);
-            candidate = parent;
-        end
-        x_next(i,:) = candidate;
     end
 end
 
@@ -1259,18 +1142,18 @@ function selected = select_candidates_by_surrogate(cand, surrogate, ym, K_TRUE, 
     mid_pool = setdiff(mid_pool, pick, 'stable');
     if ~isempty(mid_pool) && n_mid > 0
         [~, ord_mid] = sort(pred_F(mid_pool), 'descend');
-        pick = [pick; mid_pool(ord_mid(1:min(n_mid, numel(ord_mid))))]; %#ok<AGROW>
+        pick = [pick; mid_pool(ord_mid(1:min(n_mid, numel(ord_mid))))];
     end
 
     remain = setdiff((1:size(cand, 1))', pick, 'stable');
     if ~isempty(remain) && n_rand > 0
         rp = remain(randperm(numel(remain), min(n_rand, numel(remain))));
-        pick = [pick; rp]; %#ok<AGROW>
+        pick = [pick; rp];
     end
 
     if numel(pick) < K_TRUE
         remain = setdiff((1:size(cand, 1))', pick, 'stable');
-        pick = [pick; remain(1:min(K_TRUE - numel(pick), numel(remain)))]; %#ok<AGROW>
+        pick = [pick; remain(1:min(K_TRUE - numel(pick), numel(remain)))];
     end
     selected = cand(pick(1:min(K_TRUE, numel(pick))), :);
 end
@@ -1418,7 +1301,8 @@ function last_bits = do_incremental_set(h, L, last_bits, matA, matB)
     else
         changed_idx = find(cur_bits ~= last_bits);
         if ~isempty(changed_idx)
-            inc_code = 'switchtolayout;';
+            commands = cell(1, numel(changed_idx) + 1);
+            commands{1} = 'switchtolayout;';
             for ci = 1:length(changed_idx)
                 idx_i = changed_idx(ci);
                 name = ['gra', num2str(idx_i)];
@@ -1427,10 +1311,10 @@ function last_bits = do_incremental_set(h, L, last_bits, matA, matB)
                 else
                     mat_name = matB;
                 end
-                inc_code = [inc_code, ...
-                    'select("', name, '");', ...
+                commands{ci + 1} = ['select("', name, '");', ...
                     'set("material","', mat_name, '");'];
             end
+            inc_code = [commands{:}];
             appevalscript(h, inc_code);
         end
     end
@@ -1527,7 +1411,7 @@ function [nr, crw, lmse, CR_each, F_soft, worst_idx, cache_hit, early_stopped, l
             ce.F_soft = F_soft;
             ce.worst_idx = worst_idx;
             ce.is_full = false;
-            eval_cache(cache_key) = ce;
+            eval_cache(cache_key) = ce; %#ok<NASGU>
             return;
         end
     end
@@ -1549,7 +1433,7 @@ function [nr, crw, lmse, CR_each, F_soft, worst_idx, cache_hit, early_stopped, l
     ce.F_soft = F_soft;
     ce.worst_idx = worst_idx;
     ce.is_full = true;
-    eval_cache(cache_key) = ce;
+    eval_cache(cache_key) = ce; %#ok<NASGU>
 end
 
 function F = softmin_score(CR_each, tau, lambda_balance)
@@ -1560,4 +1444,16 @@ function F = softmin_score(CR_each, tau, lambda_balance)
         return;
     end
     F = -tau * log(sum(exp(-vals / tau))) - lambda_balance * std(vals);
+end
+
+function save_checkpoint(save_file)
+% 把所有断点状态从 caller workspace 收集到一个 struct 后落盘。
+% 新增/移除字段时只需改 checkpoint_var_names.m，避免 save 列表漂移。
+    var_names = checkpoint_var_names();
+    S = struct();
+    S.metric_version = evalin('caller', 'METRIC_VERSION');
+    for k = 1:numel(var_names)
+        S.(var_names{k}) = evalin('caller', var_names{k});
+    end
+    save(save_file, '-struct', 'S', '-v7.3');
 end
