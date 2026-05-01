@@ -402,15 +402,15 @@ if phase == 2
                 cand = selected;
                 fprintf('[archive bootstrap] queued %d historical candidates for full v3 evaluation.\n', take_init);
             else
-                cand = generate_eda_candidates(p_eda, ym, d, N_CAND, stall_gen);
+                cand = generate_eda_candidates(p_eda, ym, d, N_CAND, stall_gen, cache_bits, cache_CR_worst, cache_F_soft, cache_is_full);
                 cand = remove_cached_candidates(cand, eval_cache);
                 if ~isempty(surrogate)
-                    selected = select_candidates_by_surrogate(cand, surrogate, ym, K_TRUE);
+                    selected = select_candidates_by_surrogate(cand, surrogate, ym, K_TRUE, stall_gen);
                 else
                     selected = cand(1:min(K_TRUE, size(cand,1)), :);
                 end
                 if isempty(selected)
-                    selected = generate_eda_candidates(p_eda, ym, d, K_TRUE, stall_gen);
+                    selected = generate_eda_candidates(p_eda, ym, d, K_TRUE, stall_gen, cache_bits, cache_CR_worst, cache_F_soft, cache_is_full);
                 end
             end
             x = fill_stage2_population(selected, p_eda, ym, N2, d, eval_cache);
@@ -523,7 +523,7 @@ if phase == 2
         if iter < stage2_target_iter && size(cache_bits, 1) >= SURROGATE_MIN_SAMPLES
             surrogate = train_surrogate(cache_bits, cache_F_soft);
             selected_local = targeted_local_candidates(ym, surrogate, d, LOCAL_1BIT_EVAL, ...
-                                                       LOCAL_2BIT_TOP_BITS, LOCAL_2BIT_EVAL);
+                                                       LOCAL_2BIT_TOP_BITS, LOCAL_2BIT_EVAL, stall_gen);
             selected_local = remove_cached_candidates(selected_local, eval_cache);
             fprintf('[targeted local] evaluating %d surrogate-ranked neighbors, stall=%d.\n', ...
                 size(selected_local, 1), stall_gen);
@@ -1100,21 +1100,104 @@ function surrogate = train_surrogate(cache_bits, cache_F_soft)
     end
 end
 
-function cand = generate_eda_candidates(p_eda, ym, d, N_CAND, stall_gen)
-    n_eda = round(0.60 * N_CAND);
-    n_local = round(0.25 * N_CAND);
-    n_rand = max(0, N_CAND - n_eda - n_local);
+function cand = generate_eda_candidates(p_eda, ym, d, N_CAND, stall_gen, cache_bits, cache_CR_worst, cache_F_soft, cache_is_full)
+    if nargin < 6
+        cache_bits = zeros(0, d);
+        cache_CR_worst = zeros(0, 1);
+        cache_F_soft = zeros(0, 1);
+        cache_is_full = false(0, 1);
+    end
+
+    if stall_gen >= 5
+        n_archive = round(0.20 * N_CAND);
+    else
+        n_archive = round(0.08 * N_CAND);
+    end
+    n_eda = round(0.55 * N_CAND);
+    n_local = round(0.20 * N_CAND);
+    n_rand = max(0, N_CAND - n_eda - n_local - n_archive);
 
     eda = double(rand(n_eda, d) < repmat(p_eda, n_eda, 1));
     local = repmat(double(ym(:)'), n_local, 1);
-    max_flip = min(d, 4 + min(stall_gen, 4));
+    max_flip = min(d, 4 + min(stall_gen, 8));
+    min_flip = 1;
+    if stall_gen >= 5
+        min_flip = min(max_flip, 3);
+    end
     for i = 1:n_local
-        flip_count = randi([1, max_flip]);
+        flip_count = randi([min_flip, max_flip]);
         flip_idx = randperm(d, flip_count);
         local(i, flip_idx) = 1 - local(i, flip_idx);
     end
+    archive = archive_guided_candidates(ym, cache_bits, cache_CR_worst, cache_F_soft, cache_is_full, d, n_archive, stall_gen);
     random_part = double(rand(n_rand, d) > 0.5);
-    cand = unique([eda; local; random_part], 'rows', 'stable');
+    cand = unique([eda; local; archive; random_part], 'rows', 'stable');
+end
+
+function cand = archive_guided_candidates(ym, cache_bits, cache_CR_worst, cache_F_soft, cache_is_full, d, n_archive, stall_gen)
+    cand = zeros(0, d);
+    if n_archive <= 0 || isempty(cache_bits) || isempty(cache_is_full)
+        return;
+    end
+
+    full_idx = find(cache_is_full(:));
+    if isempty(full_idx)
+        return;
+    end
+
+    cr = double(cache_CR_worst(full_idx));
+    soft = double(cache_F_soft(full_idx));
+    ok = isfinite(cr) & isfinite(soft);
+    full_idx = full_idx(ok);
+    cr = cr(ok);
+    soft = soft(ok);
+    if isempty(full_idx)
+        return;
+    end
+
+    cr_score = scale01(cr);
+    soft_score = scale01(soft);
+    score = cr_score + 0.35 * soft_score;
+    [~, ord] = sort(score, 'descend');
+    pool_n = min(numel(ord), max(12, ceil(0.20 * numel(ord))));
+    pool = double(cache_bits(full_idx(ord(1:pool_n)), :));
+
+    hd_pool = sum(abs(pool - repmat(double(ym(:)'), size(pool, 1), 1)), 2);
+    diverse_pool = pool(hd_pool >= 2, :);
+    if ~isempty(diverse_pool)
+        pool = diverse_pool;
+    end
+    if isempty(pool)
+        return;
+    end
+
+    cand = zeros(n_archive, d);
+    base = double(ym(:)');
+    cross_rate = min(0.65, 0.30 + 0.03 * min(stall_gen, 10));
+    min_mut = 1;
+    if stall_gen >= 5
+        min_mut = 2;
+    end
+    max_mut = min(d, 5 + min(stall_gen, 10));
+
+    for i = 1:n_archive
+        parent = pool(randi(size(pool, 1)), :);
+        if size(pool, 1) > 1 && rand < 0.50
+            parent2 = pool(randi(size(pool, 1)), :);
+            mask = rand(1, d) < 0.50;
+            parent(mask) = parent2(mask);
+        end
+
+        trial = base;
+        inherit_mask = rand(1, d) < cross_rate;
+        trial(inherit_mask) = parent(inherit_mask);
+        flip_count = randi([min_mut, max_mut]);
+        flip_idx = randperm(d, flip_count);
+        trial(flip_idx) = 1 - trial(flip_idx);
+        cand(i, :) = trial;
+    end
+
+    cand = unique(cand, 'rows', 'stable');
 end
 
 function cand = remove_cached_candidates(cand, eval_cache)
@@ -1132,23 +1215,39 @@ function cand = remove_cached_candidates(cand, eval_cache)
     cand = cand(keep, :);
 end
 
-function selected = select_candidates_by_surrogate(cand, surrogate, ym, K_TRUE)
+function selected = select_candidates_by_surrogate(cand, surrogate, ym, K_TRUE, stall_gen)
+    if nargin < 5 || isempty(stall_gen)
+        stall_gen = 0;
+    end
     if isempty(cand)
         selected = zeros(0, numel(ym));
         return;
     end
     pred_F = predict_surrogate(surrogate, cand);
     hd = sum(abs(cand - repmat(ym, size(cand, 1), 1)), 2) / size(cand, 2);
-    acq = pred_F + 0.03 * hd;
+    hd_weight = 0.03 + 0.02 * min(stall_gen, 8);
+    acq = pred_F + hd_weight * hd;
 
-    n_top = min(size(cand, 1), max(1, round(0.70 * K_TRUE)));
-    n_mid = min(size(cand, 1) - n_top, max(0, round(0.20 * K_TRUE)));
+    if stall_gen >= 5
+        n_top_frac = 0.50;
+        n_mid_frac = 0.30;
+        mid_min_hd = 0.10;
+        mid_max_hd = 0.65;
+    else
+        n_top_frac = 0.70;
+        n_mid_frac = 0.20;
+        mid_min_hd = 0.08;
+        mid_max_hd = 0.45;
+    end
+
+    n_top = min(size(cand, 1), max(1, round(n_top_frac * K_TRUE)));
+    n_mid = min(size(cand, 1) - n_top, max(0, round(n_mid_frac * K_TRUE)));
     n_rand = max(0, K_TRUE - n_top - n_mid);
 
     [~, ord_acq] = sort(acq, 'descend');
     pick = ord_acq(1:n_top);
 
-    mid_pool = find(hd >= 0.08 & hd <= 0.45);
+    mid_pool = find(hd >= mid_min_hd & hd <= mid_max_hd);
     mid_pool = setdiff(mid_pool, pick, 'stable');
     if ~isempty(mid_pool) && n_mid > 0
         [~, ord_mid] = sort(pred_F(mid_pool), 'descend');
@@ -1215,7 +1314,9 @@ function p_eda = update_eda_probability(cache_bits, cache_CR_worst, cache_F_soft
     idx_full = find(cache_is_full);
     if numel(idx_full) >= 10
         pool_idx = idx_full;
-        score = cache_CR_worst(pool_idx);
+        cr_score = scale01(cache_CR_worst(pool_idx));
+        soft_score = scale01(cache_F_soft(pool_idx));
+        score = cr_score + 0.35 * soft_score;
     else
         pool_idx = (1:size(cache_bits, 1))';
         score = cache_F_soft(pool_idx);
@@ -1234,7 +1335,27 @@ function p_eda = update_eda_probability(cache_bits, cache_CR_worst, cache_F_soft
     p_eda = min(max(p_eda, p_min), p_max);
 end
 
-function selected_local = targeted_local_candidates(ym, surrogate, d, K1, K2_TOP_BITS, K2)
+function y = scale01(x)
+    x = double(x(:));
+    y = -inf(size(x));
+    ok = isfinite(x);
+    if ~any(ok)
+        return;
+    end
+    xmin = min(x(ok));
+    xmax = max(x(ok));
+    if xmax > xmin
+        y(ok) = (x(ok) - xmin) / (xmax - xmin);
+    else
+        y(ok) = 0.5;
+    end
+end
+
+function selected_local = targeted_local_candidates(ym, surrogate, d, K1, K2_TOP_BITS, K2, stall_gen)
+    if nargin < 7 || isempty(stall_gen)
+        stall_gen = 0;
+    end
+
     nei1 = repmat(ym, d, 1);
     for b = 1:d
         nei1(b,b) = 1 - nei1(b,b);
@@ -1244,7 +1365,8 @@ function selected_local = targeted_local_candidates(ym, surrogate, d, K1, K2_TOP
     take1 = min(K1, numel(ord1));
     eval_1bit = nei1(ord1(1:take1), :);
 
-    top_bits = ord1(1:min(K2_TOP_BITS, numel(ord1)));
+    extra_top_bits = min(max(stall_gen - 4, 0), 10);
+    top_bits = ord1(1:min(K2_TOP_BITS + extra_top_bits, numel(ord1)));
     if numel(top_bits) >= 2
         pairs = nchoosek(top_bits, 2);
         nei2 = repmat(ym, size(pairs, 1), 1);
@@ -1254,11 +1376,30 @@ function selected_local = targeted_local_candidates(ym, surrogate, d, K1, K2_TOP
         end
         pred2 = predict_surrogate(surrogate, nei2);
         [~, ord2] = sort(pred2, 'descend');
-        eval_2bit = nei2(ord2(1:min(K2, numel(ord2))), :);
+        K2_eff = K2 + min(max(stall_gen - 4, 0), 4);
+        eval_2bit = nei2(ord2(1:min(K2_eff, numel(ord2))), :);
     else
         eval_2bit = zeros(0, d);
     end
-    selected_local = unique([eval_1bit; eval_2bit], 'rows', 'stable');
+
+    if stall_gen >= 5 && numel(top_bits) >= 3
+        top3_count = min(numel(top_bits), K2_TOP_BITS + min(stall_gen, 6));
+        triples = nchoosek(top_bits(1:top3_count), 3);
+        nei3 = repmat(ym, size(triples, 1), 1);
+        for i = 1:size(triples, 1)
+            nei3(i,triples(i,1)) = 1 - nei3(i,triples(i,1));
+            nei3(i,triples(i,2)) = 1 - nei3(i,triples(i,2));
+            nei3(i,triples(i,3)) = 1 - nei3(i,triples(i,3));
+        end
+        pred3 = predict_surrogate(surrogate, nei3);
+        [~, ord3] = sort(pred3, 'descend');
+        K3 = min(6, max(3, stall_gen - 2));
+        eval_3bit = nei3(ord3(1:min(K3, numel(ord3))), :);
+    else
+        eval_3bit = zeros(0, d);
+    end
+
+    selected_local = unique([eval_1bit; eval_2bit; eval_3bit], 'rows', 'stable');
 end
 
 function last_bits = do_incremental_set(h, L, last_bits, matA, matB)
