@@ -35,11 +35,11 @@ RESULT_TAG = infer_logic_gate_name(train_data, train_target);
 train_data = train_data * pi;   % 将训练集数据加载到相位上
 
 %% 参数设置
-N1  = 1000;              % 阶段1种群规模
+N1  = 5000;              % 阶段1种群规模
 N2  = 16;                % stage-2 true evaluations per generation
 d   = 49;                % 49个孔洞的二进制材料变量
 ger2 = 10;               % 首次运行阶段2基础代数
-N_SEED_TARGET = 5;       % 阶段1需要找到的全对结构数
+N_SEED_TARGET = 25;       % 阶段1需要找到的全对结构数
 
 CONTINUE_FROM_EXISTING_RESULTS = true;  % 自动导入 record_unified*.mat 作为阶段2种子
 START_STAGE2_WITH_IMPORTED_SEEDS = true;
