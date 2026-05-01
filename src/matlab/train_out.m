@@ -1,5 +1,5 @@
 function p = train_out(h, phs)
-% 设置源相位并运行仿真，直接获取监视器透过率 T
+% 设置源相位并运行仿真，直接获取输出监视器功率
 code = strcat('switchtolayout;', ...
               'select("source1");', ...
               'set("phase",', num2str(phs(1),16), ');', ...
@@ -10,9 +10,9 @@ code = strcat('switchtolayout;', ...
               'run;');
 appevalscript(h, code);
 
-% 直接获取透过率（无文件 I/O）
-code2 = strcat('T1 = transmission("output1");', ...
-               'T2 = transmission("output2");');
+% 直接获取输出监视器功率（无文件 I/O）
+code2 = strcat('T1 = getdata("output1","power");', ...
+               'T2 = getdata("output2","power");');
 appevalscript(h, code2);
 
 T1 = appgetvar(h, 'T1');
@@ -20,14 +20,14 @@ T2 = appgetvar(h, 'T2');
 
 % 错误检查：仿真失败可能返回空或 NaN
 assert(~isempty(T1) && ~isempty(T2), ...
-    'transmission() 返回空值，仿真可能失败。');
-if any(isnan(T1)) || any(isnan(T2))
-    warning('train_out:NaN', 'transmission() 返回 NaN，输出置零。');
+    'output power 返回空值，仿真可能失败。');
+if any(isnan(T1(:))) || any(isnan(T2(:)))
+    warning('train_out:NaN', 'output power 返回 NaN，输出置零。');
     p = [0, 0];
     return;
 end
 
-% transmission() 可能返回向量（多频率），取第一个频率点
+% getdata() 可能返回向量（多频率），取第一个频率点
 if numel(T1) > 1, T1 = T1(1); end
 if numel(T2) > 1, T2 = T2(1); end
 
